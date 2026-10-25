@@ -1,0 +1,1 @@
+enum TradeMode { real, paper }

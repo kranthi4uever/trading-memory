@@ -1,0 +1,1 @@
+enum ExecutionSource { broker, manual }
