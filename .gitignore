@@ -86,3 +86,7 @@ credentials/
 # Temporary deployment and patch backups
 .patch-backup-*/
 backup-hosted-auth-*/
+
+# Native platform build artifacts
+**/build/
+**/DerivedData/

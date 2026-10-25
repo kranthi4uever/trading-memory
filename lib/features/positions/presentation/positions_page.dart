@@ -1439,20 +1439,51 @@ class _ExitLegsFormState extends State<_ExitLegsForm> {
 
   @override
   Widget build(BuildContext context) {
+    final isNarrow = MediaQuery.sizeOf(context).width < 600;
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Exit selected legs'),
+        title: const Text('Exit selected legs', softWrap: true, maxLines: 2),
+        toolbarHeight: isNarrow ? 80 : kToolbarHeight,
         backgroundColor: _positionPageBackground,
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Cancel'),
-          ),
-          const SizedBox(width: 8),
-          FilledButton(onPressed: _submit, child: const Text('Record exit')),
-          const SizedBox(width: 12),
-        ],
+        actions: isNarrow
+            ? null
+            : [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('Cancel'),
+                ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  onPressed: _submit,
+                  child: const Text('Record exit'),
+                ),
+                const SizedBox(width: 12),
+              ],
+        bottom: isNarrow
+            ? PreferredSize(
+                preferredSize: const Size.fromHeight(56),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      TextButton(
+                        onPressed: () => Navigator.of(context).pop(),
+                        child: const Text('Cancel'),
+                      ),
+                      const SizedBox(width: 8),
+                      FilledButton(
+                        onPressed: _submit,
+                        child: const Text('Record exit'),
+                      ),
+                    ],
+                  ),
+                ),
+              )
+            : null,
       ),
+
       body: SafeArea(
         child: ListView(
           padding: const EdgeInsets.all(16),
