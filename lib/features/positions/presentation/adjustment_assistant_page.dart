@@ -56,9 +56,16 @@ class _AdjustmentAssistantPageState extends State<AdjustmentAssistantPage> {
 
   Future<void> _loadEpisodes() async {
     try {
-      final episodes = await widget.repository.getAdjustmentEpisodes(widget.trade.id.value);
+      final trades = await widget.repository.getTrades();
+      final episodes = <AdjustmentEpisode>[];
+      for (final trade in trades) {
+        episodes.addAll(
+          await widget.repository.getAdjustmentEpisodes(trade.id.value),
+        );
+      }
+      episodes.sort((a, b) => b.createdAt.compareTo(a.createdAt));
       if (!mounted) return;
-      setState(() { _episodes = episodes; _loading = false; });
+      setState(() { _episodes = List.unmodifiable(episodes); _loading = false; });
     } catch (error) {
       if (!mounted) return;
       setState(() { _loading = false; _error = 'Could not load adjustment history: $error'; });

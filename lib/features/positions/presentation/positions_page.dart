@@ -14,6 +14,7 @@ import '../../../domain/trading/position_state/market_snapshot.dart';
 import '../../../domain/trading/position_state/geometry_snapshot.dart';
 import '../../../domain/trading/position_state/economic_snapshot.dart';
 import '../../../domain/trading/position_state/risk_snapshot.dart';
+import '../../../domain/trading/position_state_similarity_service.dart';
 import '../../../domain/trading/execution/execution_id.dart';
 import '../../../domain/trading/execution/execution_source.dart';
 import '../../../domain/trading/execution/expiry_date.dart';
@@ -43,7 +44,7 @@ class PositionsPage extends StatelessWidget {
     this.selectedState,
     this.selectedDecision,
     this.forceStaticPayoff = false,
-    this.similarTrades = const [],
+    this.similarMatches = const [],
     this.repository,
   });
   final Trade trade;
@@ -55,7 +56,7 @@ class PositionsPage extends StatelessWidget {
 
   /// Decision details are read-only even when they reference the latest state.
   final bool forceStaticPayoff;
-  final List<Trade> similarTrades;
+  final List<SimilarPositionMatch> similarMatches;
 
   Future<void> _deleteTrade(BuildContext context) async {
     final confirmed = await showDialog<bool>(
@@ -246,8 +247,8 @@ class PositionsPage extends StatelessWidget {
             if (trade.status.name != 'closed') ...[
               const SizedBox(height: 4),
               _SnapshotExpansion(
-                title: 'Similar trades · ${similarTrades.length}',
-                child: similarTrades.isEmpty
+                title: 'Similar trades · ${similarMatches.length}',
+                child: similarMatches.isEmpty
                     ? const Padding(
                         padding: EdgeInsets.symmetric(vertical: 12),
                         child: Text(
@@ -256,8 +257,8 @@ class PositionsPage extends StatelessWidget {
                       )
                     : Column(
                         children: [
-                          for (final item in similarTrades)
-                            _SimilarTradeCard(trade: item),
+                          for (final item in similarMatches)
+                            _SimilarTradeCard(match: item),
                         ],
                       ),
               ),
@@ -1566,36 +1567,89 @@ class _ExitLegsFormState extends State<_ExitLegsForm> {
 }
 
 class _SimilarTradeCard extends StatelessWidget {
-  const _SimilarTradeCard({required this.trade});
-  final Trade trade;
+  const _SimilarTradeCard({required this.match});
+  final SimilarPositionMatch match;
+
   @override
   Widget build(BuildContext context) {
-    final last = trade.positionStates.isEmpty
-        ? null
-        : trade.positionStates.last;
-    final pnl = last?.economics.pnl;
-    final expiry = trade.executions
-        .map((e) => e.contract.expiry.value)
-        .reduce((a, b) => a.isBefore(b) ? a : b);
+    final trade = match.trade;
+    final state = match.state;
+    final pnl = state.economics.pnl;
+    final expiry = state.position.expiry.value;
+    final percent = (match.score * 100).round();
+    final topFactors = [...match.factors]
+      ..sort((a, b) => (b.similarity ?? -1).compareTo(a.similarity ?? -1));
     return Card(
       elevation: 0,
       margin: const EdgeInsets.only(bottom: 8),
-      child: ListTile(
+      child: ExpansionTile(
         title: Text(
-          '${trade.executions.first.contract.underlying} · ${trade.strategy.name}',
+          '${state.position.underlying} · ${state.position.strategy.name}',
           style: const TextStyle(fontWeight: FontWeight.w700),
         ),
         subtitle: Text(
-          'Closed · Expiry ${_dateLabel(expiry)} · ${trade.positionStates.length} snapshots',
+          '$percent% contextual similarity · ${state.position.legs.length} legs · ${_dateLabel(state.capturedAt.toLocal())}',
         ),
-        trailing: Text(
-          pnl == null
-              ? 'P&L unavailable'
-              : '${pnl < 0 ? '−' : ''}₹${pnl.abs().toStringAsFixed(2)}',
+        trailing: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Text(
+              pnl == null
+                  ? 'Snapshot P&L n/a'
+                  : 'Snapshot ${pnl < 0 ? '−' : ''}₹${pnl.abs().toStringAsFixed(0)}',
+              style: const TextStyle(fontSize: 12),
+            ),
+            Text(
+              state.economics.netRealizedPnl == null
+                  ? 'Outcome unavailable'
+                  : 'Net realized ₹${state.economics.netRealizedPnl!.toStringAsFixed(0)}',
+              style: const TextStyle(fontSize: 11, color: Colors.black54),
+            ),
+          ],
         ),
-        onTap: () => Navigator.of(context).push(
-          MaterialPageRoute<void>(builder: (_) => PositionsPage(trade: trade)),
-        ),
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+        children: [
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              'Original trade: ${trade.strategy.name} · Closed ${trade.closedAt == null ? 'date unavailable' : _dateLabel(trade.closedAt!.toLocal())} · Expiry ${_dateLabel(expiry)}',
+            ),
+          ),
+          const SizedBox(height: 6),
+          for (final factor in topFactors)
+            if (factor.similarity != null)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 2),
+                child: Row(
+                  children: [
+                    Expanded(child: Text(factor.name)),
+                    Text('${(factor.similarity! * 100).round()}%'),
+                  ],
+                ),
+              ),
+          const SizedBox(height: 8),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: OutlinedButton.icon(
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => PositionsPage(
+                    trade: trade,
+                    selectedState: state,
+                    forceStaticPayoff: true,
+                  ),
+                ),
+              ),
+              icon: const Icon(Icons.history),
+              label: const Text('Open matched historical state'),
+            ),
+          ),
+          const Text(
+            'Similarity describes recorded context, not the probability of a profitable outcome.',
+            style: TextStyle(fontSize: 12, color: Colors.black54),
+          ),
+        ],
       ),
     );
   }

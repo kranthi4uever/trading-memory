@@ -26,6 +26,7 @@ import 'domain/trading/position_state/position_state.dart';
 import 'domain/trading/position_state/position_state_id.dart';
 import 'domain/trading/position_state/risk_snapshot.dart';
 import 'domain/trading/trading_repository.dart';
+import 'domain/trading/position_state_similarity_service.dart';
 import 'infrastructure/persistence/sqlite/sqlite_trading_repository.dart';
 import 'infrastructure/persistence/sqlite/trading_database.dart';
 
@@ -176,25 +177,22 @@ class _PositionsHomeState extends State<PositionsHome> {
       );
     } else {
       final allTrades = await widget.repository.getTrades();
-      final underlying = trade.executions.first.contract.underlying;
-      final comparableClosedTrades = trade.status == TradeStatus.closed
-          ? const <Trade>[]
-          : allTrades
-                .where(
-                  (candidate) =>
-                      candidate.id != trade.id &&
-                      candidate.status == TradeStatus.closed &&
-                      candidate.executions.isNotEmpty &&
-                      candidate.executions.first.contract.underlying ==
-                          underlying &&
-                      candidate.strategy == trade.strategy,
-                )
-                .toList();
+      final orderedStates = [...trade.positionStates]
+        ..sort((a, b) => a.capturedAt.compareTo(b.capturedAt));
+      final currentState = orderedStates.isEmpty ? null : orderedStates.last;
+      final similarPositionMatches =
+          trade.status == TradeStatus.closed || currentState == null
+          ? const <SimilarPositionMatch>[]
+          : const PositionStateSimilarityService().findMatches(
+              current: currentState,
+              trades: allTrades,
+              limit: 10,
+            );
       await Navigator.of(context).push<bool>(
         MaterialPageRoute<bool>(
           builder: (_) => PositionsPage(
             trade: trade,
-            similarTrades: comparableClosedTrades,
+            similarMatches: similarPositionMatches,
             repository: widget.repository,
           ),
         ),
