@@ -25,7 +25,9 @@ import '../../../domain/trading/trading_repository.dart';
 import 'trading_database.dart';
 
 import 'package:sqflite/sqflite.dart';
+
 import 'dart:convert';
+
 import '../../../domain/trading/adjustment/adjustment_episode.dart';
 import '../../../domain/trading/adjustment/adjustment_reason.dart';
 import '../../../domain/trading/adjustment/position_view_assessment.dart';
@@ -986,7 +988,8 @@ class SqliteTradingRepository implements TradingRepository {
 
         cost: (snapshot['cost'] as num?)?.toDouble(),
         grossRealizedPnl: (snapshot['gross_realized_pnl'] as num?)?.toDouble(),
-        grossUnrealizedPnl: (snapshot['gross_unrealized_pnl'] as num?)?.toDouble(),
+        grossUnrealizedPnl: (snapshot['gross_unrealized_pnl'] as num?)
+            ?.toDouble(),
         actualCharges: (snapshot['actual_charges'] as num?)?.toDouble(),
         netRealizedPnl: (snapshot['net_realized_pnl'] as num?)?.toDouble(),
         returnOnMarginPercentage:
@@ -1585,12 +1588,21 @@ class SqliteTradingRepository implements TradingRepository {
         whereArgs: [tradeId.value],
       );
 
-      // Remove the performance row before checking remaining foreign-key references.
-      await txn.delete(
-        'trade_performance',
-        where: 'trade_id = ?',
-        whereArgs: [tradeId.value],
+      // Some existing installations do not have the optional
+      // trade_performance table (it is not part of schema version 9).
+      // Only delete from it when it actually exists; otherwise a valid
+      // position deletion must not fail with 'no such table'.
+      final performanceTable = await txn.rawQuery(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ['trade_performance'],
       );
+      if (performanceTable.isNotEmpty) {
+        await txn.delete(
+          'trade_performance',
+          where: 'trade_id = ?',
+          whereArgs: [tradeId.value],
+        );
+      }
 
       // Diagnose any remaining direct foreign-key references to this trade.
 
@@ -1700,7 +1712,10 @@ class SqliteTradingRepository implements TradingRepository {
   @override
   Future<void> saveAdjustmentEpisode(AdjustmentEpisode episode) async {
     final db = await _tradingDatabase.database;
-    Map<String, Object?> viewMap(String prefix, PositionViewAssessment? view) => {
+    Map<String, Object?> viewMap(
+      String prefix,
+      PositionViewAssessment? view,
+    ) => {
       '${prefix}view_suggested': view?.suggestedView.name,
       '${prefix}view_confirmed': view?.confirmedView.name,
       '${prefix}view_assessed_at': view?.assessedAt.toIso8601String(),
@@ -1724,25 +1739,39 @@ class SqliteTradingRepository implements TradingRepository {
       'status': episode.status.name,
       'failure_message': episode.failureMessage,
     };
-    await db.insert('adjustment_episodes', row, conflictAlgorithm: ConflictAlgorithm.replace);
+    await db.insert(
+      'adjustment_episodes',
+      row,
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
   }
 
   @override
   Future<List<AdjustmentEpisode>> getAdjustmentEpisodes(String tradeId) async {
     final db = await _tradingDatabase.database;
-    final rows = await db.query('adjustment_episodes', where: 'trade_id = ?', whereArgs: [tradeId], orderBy: 'created_at DESC');
+    final rows = await db.query(
+      'adjustment_episodes',
+      where: 'trade_id = ?',
+      whereArgs: [tradeId],
+      orderBy: 'created_at DESC',
+    );
     PositionViewAssessment parseView(Map<String, Object?> row, String prefix) {
       final suggested = row['${prefix}view_suggested'] as String?;
       final confirmed = row['${prefix}view_confirmed'] as String?;
       final assessedAt = row['${prefix}view_assessed_at'] as String?;
       if (suggested == null || confirmed == null || assessedAt == null) {
-        throw StateError('Stored adjustment episode is missing its required $prefix view.');
+        throw StateError(
+          'Stored adjustment episode is missing its required $prefix view.',
+        );
       }
       final evidenceJson = row['${prefix}view_evidence'] as String? ?? '[]';
       return PositionViewAssessment(
         id: '${row['id']}:$prefix',
         tradeId: row['trade_id'] as String,
-        positionStateId: row['${prefix == 'before_' ? 'before' : 'after'}_position_state_id'] as String? ?? row['before_position_state_id'] as String,
+        positionStateId:
+            row['${prefix == 'before_' ? 'before' : 'after'}_position_state_id']
+                as String? ??
+            row['before_position_state_id'] as String,
         assessedAt: DateTime.parse(assessedAt),
         suggestedView: MarketView.values.byName(suggested),
         confirmedView: MarketView.values.byName(confirmed),
@@ -1751,26 +1780,36 @@ class SqliteTradingRepository implements TradingRepository {
         correctionNote: row['${prefix}view_correction_note'] as String?,
       );
     }
-    return rows.map((row) {
-      final reasonName = row['reason'] as String;
-      final executionIds = (jsonDecode(row['execution_ids'] as String? ?? '[]') as List).cast<String>();
-      return AdjustmentEpisode(
-        id: row['id'] as String,
-        tradeId: row['trade_id'] as String,
-        beforePositionStateId: row['before_position_state_id'] as String,
-        afterPositionStateId: row['after_position_state_id'] as String?,
-        beforeView: parseView(row, 'before_'),
-        afterView: row['after_view_confirmed'] == null ? null : parseView(row, 'after_'),
-        reason: AdjustmentReason.values.byName(reasonName),
-        reasonNote: row['reason_note'] as String?,
-        selectedProposalId: row['selected_proposal_id'] as String?,
-        executionIds: executionIds,
-        createdAt: DateTime.parse(row['created_at'] as String),
-        confirmedAt: row['confirmed_at'] == null ? null : DateTime.parse(row['confirmed_at'] as String),
-        status: AdjustmentEpisodeStatus.values.byName(row['status'] as String),
-        failureMessage: row['failure_message'] as String?,
-      );
-    }).toList(growable: false);
-  }
 
+    return rows
+        .map((row) {
+          final reasonName = row['reason'] as String;
+          final executionIds = (jsonDecode(
+            row['execution_ids'] as String? ?? '[]',
+          ) as List).cast<String>();
+          return AdjustmentEpisode(
+            id: row['id'] as String,
+            tradeId: row['trade_id'] as String,
+            beforePositionStateId: row['before_position_state_id'] as String,
+            afterPositionStateId: row['after_position_state_id'] as String?,
+            beforeView: parseView(row, 'before_'),
+            afterView: row['after_view_confirmed'] == null
+                ? null
+                : parseView(row, 'after_'),
+            reason: AdjustmentReason.values.byName(reasonName),
+            reasonNote: row['reason_note'] as String?,
+            selectedProposalId: row['selected_proposal_id'] as String?,
+            executionIds: executionIds,
+            createdAt: DateTime.parse(row['created_at'] as String),
+            confirmedAt: row['confirmed_at'] == null
+                ? null
+                : DateTime.parse(row['confirmed_at'] as String),
+            status: AdjustmentEpisodeStatus.values.byName(
+              row['status'] as String,
+            ),
+            failureMessage: row['failure_message'] as String?,
+          );
+        })
+        .toList(growable: false);
+  }
 }

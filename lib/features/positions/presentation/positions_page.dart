@@ -1,6 +1,9 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 
 import '../../../domain/trade/trade.dart';
 import '../../../domain/trading/execution/execution.dart';
@@ -25,9 +28,36 @@ import '../../../domain/trading/trading_repository.dart';
 import '../../../domain/trading/adjustment/adjustment_proposal.dart';
 import 'adjustment_assistant_page.dart';
 import '../../market_data/presentation/nifty_option_chain_page.dart';
+import '../../market_data/market_data_auth.dart';
 
 const _positionBrand = Color(0xFF176B87);
 const _positionPageBackground = Color(0xFFF7F9FA);
+
+/// Reuses the exact interactive payoff implementation on the main Positions
+/// list, so the inline view and the full position details stay consistent.
+class PositionInteractivePayoffPanel extends StatelessWidget {
+  const PositionInteractivePayoffPanel({super.key, required this.trade});
+
+  final Trade trade;
+
+  @override
+  Widget build(BuildContext context) {
+    final states = [...trade.positionStates]
+      ..sort((a, b) => a.capturedAt.compareTo(b.capturedAt));
+    final latest = states.isEmpty ? null : states.last;
+    if (trade.status == TradeStatus.closed ||
+        latest == null ||
+        latest.position.legs.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.all(12),
+        child: Text(
+          'Interactive payoff is unavailable for this position state.',
+        ),
+      );
+    }
+    return _InteractivePositionPayoff(trade: trade, state: latest);
+  }
+}
 
 String _dateLabel(DateTime value) =>
     '${value.year.toString().padLeft(4, '0')}-${value.month.toString().padLeft(2, '0')}-${value.day.toString().padLeft(2, '0')}';
@@ -177,37 +207,61 @@ class PositionsPage extends StatelessWidget {
                         ),
                       ),
                       const SizedBox(height: 10),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          FilledButton.tonalIcon(
-                            onPressed: () => _addLegs(context, latestState),
-                            icon: const Icon(Icons.add),
-                            label: const Text('Add legs'),
-                          ),
-                          OutlinedButton.icon(
-                            onPressed: () => _editLegs(context, latestState),
-                            icon: const Icon(Icons.edit_outlined),
-                            label: const Text('Edit legs'),
-                          ),
-                          OutlinedButton.icon(
-                            onPressed: () => _exitLegs(context, latestState),
-                            icon: const Icon(Icons.logout),
-                            label: const Text('Exit legs'),
-                          ),
-                          OutlinedButton.icon(
-                            onPressed: () =>
-                                _holdPosition(context, latestState),
-                            icon: const Icon(Icons.pause_circle_outline),
-                            label: const Text('Hold'),
-                          ),
-                        ],
+                      LayoutBuilder(
+                        builder: (context, constraints) {
+                          const gap = 12.0;
+                          final actionWidth = (constraints.maxWidth - gap) / 2;
+                          return Wrap(
+                            spacing: gap,
+                            runSpacing: gap,
+                            children: [
+                              _PositionActionButton(
+                                width: actionWidth,
+                                icon: Icons.add,
+                                label: 'Add legs',
+                                onPressed: () => _addLegs(context, latestState),
+                              ),
+                              _PositionActionButton(
+                                width: actionWidth,
+                                icon: Icons.edit_outlined,
+                                label: 'Edit legs',
+                                onPressed: () =>
+                                    _editLegs(context, latestState),
+                              ),
+                              _PositionActionButton(
+                                width: actionWidth,
+                                icon: Icons.logout,
+                                label: 'Exit legs',
+                                onPressed: () =>
+                                    _exitLegs(context, latestState),
+                              ),
+                              _PositionActionButton(
+                                width: actionWidth,
+                                icon: Icons.pause_circle_outline,
+                                label: 'Hold',
+                                onPressed: () =>
+                                    _holdPosition(context, latestState),
+                              ),
+                            ],
+                          );
+                        },
                       ),
-                      const Divider(height: 22),
+                      const SizedBox(height: 16),
                       SizedBox(
                         width: double.infinity,
+                        height: 54,
                         child: FilledButton.icon(
+                          style: FilledButton.styleFrom(
+                            backgroundColor: const Color(0xFF176B87),
+                            foregroundColor: Colors.white,
+                            minimumSize: const Size.fromHeight(54),
+                            shape: const StadiumBorder(),
+                            padding: const EdgeInsets.symmetric(horizontal: 20),
+                            textStyle: const TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
                           onPressed: () => Navigator.of(context).push(
                             MaterialPageRoute<void>(
                               builder: (_) => AdjustmentAssistantPage(
@@ -799,6 +853,115 @@ class PositionsPage extends StatelessWidget {
     );
   }
 
+  Future<({List<PositionLeg> legs, double? spot, double? vix})>
+  _refreshCaptureMarketData(List<PositionLeg> legs) async {
+    if (legs.isEmpty) {
+      return (legs: legs, spot: null, vix: null);
+    }
+    if (legs.any((leg) => leg.contract.underlying.toUpperCase() != 'NIFTY')) {
+      return (
+        legs: legs
+            .map(
+              (leg) => PositionLeg(
+                contract: leg.contract,
+                side: leg.side,
+                quantity: leg.quantity,
+                entryPremium: leg.entryPremium,
+                marketPrice: null,
+              ),
+            )
+            .toList(growable: false),
+        spot: null,
+        vix: null,
+      );
+    }
+    final token = await MarketDataAuth.readToken();
+    if (token == null || token.isEmpty) {
+      return (
+        legs: legs
+            .map(
+              (leg) => PositionLeg(
+                contract: leg.contract,
+                side: leg.side,
+                quantity: leg.quantity,
+                entryPremium: leg.entryPremium,
+                // Do not misrepresent a previous mark as a capture-time quote.
+                marketPrice: null,
+              ),
+            )
+            .toList(growable: false),
+        spot: null,
+        vix: null,
+      );
+    }
+
+    final latestPrices = <String, double>{};
+    double? latestSpot;
+    double? latestVix;
+    for (final expiry
+        in legs.map((leg) => leg.contract.expiry.toString()).toSet()) {
+      try {
+        final response = await http
+            .get(
+              Uri.parse(
+                '$tradingMemoryMarketDataBaseUrl/api/nifty/chain?expiry=$expiry&wing_count=30',
+              ),
+              headers: {
+                'X-Trading-Memory-Token': token,
+                'Accept': 'application/json',
+              },
+            )
+            .timeout(const Duration(seconds: 12));
+        if (response.statusCode < 200 || response.statusCode >= 300) continue;
+        final decoded = jsonDecode(response.body);
+        if (decoded is! Map<String, dynamic>) continue;
+        final spot = (decoded['spot'] as num?)?.toDouble();
+        final vix = (decoded['india_vix'] as num?)?.toDouble();
+        if (spot != null && spot.isFinite && spot > 0) latestSpot = spot;
+        if (vix != null && vix.isFinite && vix > 0) latestVix = vix;
+        for (final raw in decoded['strikes'] as List<dynamic>? ?? const []) {
+          if (raw is! Map<String, dynamic>) continue;
+          final strike = (raw['strike'] as num?)?.toInt();
+          if (strike == null) continue;
+          for (final leg in legs.where(
+            (item) =>
+                item.contract.expiry.toString() == expiry &&
+                item.contract.strike == strike,
+          )) {
+            final quote =
+                raw[leg.contract.optionType == OptionType.call
+                    ? 'call'
+                    : 'put'];
+            final price = quote is Map<String, dynamic>
+                ? (quote['last_price'] as num?)?.toDouble()
+                : null;
+            if (price != null && price.isFinite && price >= 0) {
+              latestPrices['${leg.contract.expiry}|${leg.contract.strike}|${leg.contract.optionType.name}'] =
+                  price;
+            }
+          }
+        }
+      } catch (_) {
+        // Missing quotes remain unavailable in this snapshot.
+      }
+    }
+
+    final refreshedLegs = legs
+        .map((leg) {
+          final key =
+              '${leg.contract.expiry}|${leg.contract.strike}|${leg.contract.optionType.name}';
+          return PositionLeg(
+            contract: leg.contract,
+            side: leg.side,
+            quantity: leg.quantity,
+            entryPremium: leg.entryPremium,
+            marketPrice: latestPrices[key],
+          );
+        })
+        .toList(growable: false);
+    return (legs: refreshedLegs, spot: latestSpot, vix: latestVix);
+  }
+
   Future<void> _captureUpdatedState(
     BuildContext context,
     PositionState previous,
@@ -819,6 +982,15 @@ class PositionsPage extends StatelessWidget {
       ),
     );
     if (metrics == null || !context.mounted) return;
+
+    // Capture market marks at the decision point, rather than reusing prices
+    // from the previous position state. Missing quotes stay unavailable.
+    final captureMarket = await _refreshCaptureMarketData(legs);
+    legs = captureMarket.legs;
+    if (!context.mounted) return;
+    final capturedSpot = captureMarket.spot ?? metrics.spot;
+    final capturedVix = captureMarket.vix ?? metrics.vix;
+
     if (action == DecisionAction.hold &&
         (metrics.observation?.trim().isEmpty ?? true)) {
       _message(
@@ -879,8 +1051,8 @@ class PositionsPage extends StatelessWidget {
           plannedRules: previous.position.plannedRules,
         ),
         market: MarketSnapshot(
-          spot: metrics.spot,
-          vix: metrics.vix,
+          spot: capturedSpot,
+          vix: capturedVix,
           atmStraddle: metrics.atmStraddle,
         ),
         geometry: GeometrySnapshot(
@@ -953,8 +1125,8 @@ class PositionsPage extends StatelessWidget {
           plannedRules: previous.position.plannedRules,
         ),
         market: MarketSnapshot(
-          spot: metrics.spot,
-          vix: metrics.vix,
+          spot: capturedSpot,
+          vix: capturedVix,
           atmStraddle: metrics.atmStraddle,
         ),
         geometry: GeometrySnapshot(
@@ -1922,6 +2094,14 @@ class _InteractivePositionPayoffState
   late double _initialDte;
   late bool _spotWasCaptured;
   late bool _vixWasCaptured;
+  Timer? _marketRefreshTimer;
+  bool _scenarioMode = false;
+  bool _marketRefreshInProgress = false;
+  double? _marketSpot;
+  double? _marketVix;
+  DateTime? _marketFetchedAt;
+  String? _marketStatus;
+  final Map<String, double> _liveOptionPrices = <String, double>{};
 
   @override
   void initState() {
@@ -1960,16 +2140,191 @@ class _InteractivePositionPayoffState
     _spot = _initialSpot;
     _vix = _initialVix;
     _dte = _initialDte;
+    // The saved PositionState is the initial fallback. Once connected, the
+    // market snapshot becomes the baseline and remains the default until the
+    // user deliberately enters scenario mode.
+    _refreshMarketBaseline();
+    _marketRefreshTimer = Timer.periodic(
+      const Duration(seconds: 15),
+      (_) => _refreshMarketBaseline(),
+    );
   }
 
-  void _resetSpot() => setState(() => _spot = _initialSpot);
-  void _resetVix() => setState(() => _vix = _initialVix);
-  void _resetDte() => setState(() => _dte = _initialDte);
-  void _resetAll() => setState(() {
-    _spot = _initialSpot;
-    _vix = _initialVix;
-    _dte = _initialDte;
+  @override
+  void didUpdateWidget(covariant _InteractivePositionPayoff oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.state.id != widget.state.id) {
+      _marketRefreshTimer?.cancel();
+      _marketSpot = null;
+      _marketVix = null;
+      _liveOptionPrices.clear();
+      _scenarioMode = false;
+      _refreshMarketBaseline();
+      _marketRefreshTimer = Timer.periodic(
+        const Duration(seconds: 15),
+        (_) => _refreshMarketBaseline(),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    _marketRefreshTimer?.cancel();
+    super.dispose();
+  }
+
+  String _quoteKey(PositionLeg leg) =>
+      '${leg.contract.underlying}|${leg.contract.expiry}|${leg.contract.strike}|${leg.contract.optionType.name}';
+
+  double _currentDaysToExpiry(DateTime expiry) =>
+      (expiry.difference(DateTime.now()).inSeconds / 86400)
+          .clamp(0.0, 365.0)
+          .toDouble();
+
+  double _scenarioDaysFor(PositionLeg leg) {
+    final positionExpiry = widget.state.position.expiry.value;
+    final baselineDte = _currentDaysToExpiry(positionExpiry);
+    final scenarioShift = _dte - baselineDte;
+    return (_currentDaysToExpiry(leg.contract.expiry.value) + scenarioShift)
+        .clamp(0.0, 365.0)
+        .toDouble();
+  }
+
+  Future<void> _refreshMarketBaseline() async {
+    if (_marketRefreshInProgress || !mounted) return;
+    final legs = widget.state.position.legs;
+    if (legs.isEmpty || legs.any((leg) => leg.contract.underlying != 'NIFTY')) {
+      if (mounted &&
+          _marketStatus != 'Live market feed supports NIFTY positions only') {
+        setState(
+          () =>
+              _marketStatus = 'Live market feed supports NIFTY positions only',
+        );
+      }
+      return;
+    }
+    _marketRefreshInProgress = true;
+    try {
+      final token = await MarketDataAuth.readToken();
+      if (token == null || token.isEmpty) {
+        if (mounted)
+          setState(
+            () => _marketStatus =
+                'Market feed not paired; showing saved snapshot',
+          );
+        return;
+      }
+      final expiryKeys = legs
+          .map((leg) => leg.contract.expiry.toString())
+          .toSet();
+      final refreshedPrices = <String, double>{};
+      double? latestSpot;
+      double? latestVix;
+      DateTime? fetchedAt;
+      for (final expiry in expiryKeys) {
+        final uri = Uri.parse(
+          '$tradingMemoryMarketDataBaseUrl/api/nifty/chain?expiry=$expiry&wing_count=30',
+        );
+        final response = await http
+            .get(
+              uri,
+              headers: {
+                'X-Trading-Memory-Token': token,
+                'Accept': 'application/json',
+              },
+            )
+            .timeout(const Duration(seconds: 12));
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          throw StateError(
+            'Market-data request failed (HTTP ${response.statusCode})',
+          );
+        }
+        final decoded = jsonDecode(response.body);
+        if (decoded is! Map<String, dynamic>)
+          throw const FormatException('Invalid market response');
+        final spot = (decoded['spot'] as num?)?.toDouble();
+        final vix = (decoded['india_vix'] as num?)?.toDouble();
+        if (spot != null && spot.isFinite && spot > 0) latestSpot = spot;
+        if (vix != null && vix.isFinite && vix > 0) latestVix = vix;
+        final timestamp = DateTime.tryParse(
+          decoded['snapshot_fetched_at']?.toString() ?? '',
+        );
+        if (timestamp != null &&
+            (fetchedAt == null || timestamp.isAfter(fetchedAt)))
+          fetchedAt = timestamp;
+        for (final raw
+            in decoded['strikes'] as List<dynamic>? ?? const <dynamic>[]) {
+          if (raw is! Map<String, dynamic>) continue;
+          final strike = (raw['strike'] as num?)?.toInt();
+          if (strike == null) continue;
+          for (final leg in legs.where(
+            (item) =>
+                item.contract.expiry.toString() == expiry &&
+                item.contract.strike == strike,
+          )) {
+            final quote =
+                raw[leg.contract.optionType == OptionType.call
+                    ? 'call'
+                    : 'put'];
+            final price = quote is Map<String, dynamic>
+                ? (quote['last_price'] as num?)?.toDouble()
+                : null;
+            if (price != null && price.isFinite && price >= 0)
+              refreshedPrices[_quoteKey(leg)] = price;
+          }
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        if (latestSpot != null) _marketSpot = latestSpot;
+        if (latestVix != null) _marketVix = latestVix;
+        _liveOptionPrices
+          ..clear()
+          ..addAll(refreshedPrices);
+        _marketFetchedAt = fetchedAt ?? DateTime.now();
+        _marketStatus = 'Market snapshot refreshed';
+        if (!_scenarioMode) {
+          if (_marketSpot != null) _spot = _marketSpot!;
+          if (_marketVix != null)
+            _vix = _marketVix!.clamp(1.0, 100.0).toDouble();
+          final expiry = widget.state.position.expiry.value;
+          _dte = _currentDaysToExpiry(expiry);
+        }
+      });
+    } catch (error) {
+      if (mounted)
+        setState(
+          () => _marketStatus =
+              'Market feed unavailable; using last valid snapshot',
+        );
+    } finally {
+      _marketRefreshInProgress = false;
+    }
+  }
+
+  void _resetSpot() => setState(() {
+    _scenarioMode = false;
+    _spot = (_marketSpot ?? _initialSpot);
   });
+  void _resetVix() => setState(() {
+    _scenarioMode = false;
+    _vix = (_marketVix ?? _initialVix).clamp(1.0, 100.0).toDouble();
+  });
+  void _resetDte() => setState(() {
+    _scenarioMode = false;
+    final expiry = widget.state.position.expiry.value;
+    _dte = _currentDaysToExpiry(expiry);
+  });
+  void _resetAll() {
+    setState(() {
+      _scenarioMode = false;
+      _spot = _marketSpot ?? _initialSpot;
+      _vix = (_marketVix ?? _initialVix).clamp(1.0, 100.0).toDouble();
+      final expiry = widget.state.position.expiry.value;
+      _dte = _currentDaysToExpiry(expiry);
+    });
+    _refreshMarketBaseline();
+  }
 
   double _cdf(double x) {
     final ax = x.abs();
@@ -2063,9 +2418,29 @@ class _InteractivePositionPayoffState
         strike: leg.contract.strike.toDouble(),
         isCall: leg.contract.optionType == OptionType.call,
         volPct: _vix,
-        days: _dte,
+        days: _scenarioDaysFor(leg),
       );
-      mtm += sign * (model.price - entryPremium) * leg.quantity;
+      final liveQuote = _liveOptionPrices[_quoteKey(leg)];
+      final marketSpot = _marketSpot ?? _initialSpot;
+      final marketVol = _marketVix ?? _initialVix;
+      final marketDte =
+          (leg.contract.expiry.value.difference(DateTime.now()).inSeconds /
+                  86400)
+              .clamp(0.0, 365.0)
+              .toDouble();
+      final marketModel = _optionModel(
+        spot: marketSpot,
+        strike: leg.contract.strike.toDouble(),
+        isCall: leg.contract.optionType == OptionType.call,
+        volPct: marketVol,
+        days: marketDte,
+      );
+      final scenarioOptionValue = liveQuote != null
+          ? math
+                .max(0.0, liveQuote + model.price - marketModel.price)
+                .toDouble()
+          : model.price;
+      mtm += sign * (scenarioOptionValue - entryPremium) * leg.quantity;
       final intrinsic =
           (leg.contract.optionType == OptionType.call
                   ? math.max(0.0, _spot - leg.contract.strike)
@@ -2086,13 +2461,22 @@ class _InteractivePositionPayoffState
     final maxSpot = (_spot + visibleHalfRange).toDouble();
     // Spot scenarios are anchored to the saved/captured spot, move in 10-point
     // increments, and stay within +/-20% regardless of the chart zoom level.
-    final spotSliderMin = ((_initialSpot * 0.8) / 10).ceil() * 10.0;
-    final spotSliderMax = ((_initialSpot * 1.2) / 10).floor() * 10.0;
+    final spotAnchor = _marketSpot ?? _initialSpot;
+    final spotSliderMin = math.min(
+      ((spotAnchor * 0.8) / 10).floor() * 10.0,
+      (_spot / 10).floor() * 10.0,
+    );
+    final spotSliderMax = math.max(
+      ((spotAnchor * 1.2) / 10).ceil() * 10.0,
+      (_spot / 10).ceil() * 10.0,
+    );
     final spotSliderDivisions = math.max(
       1,
       ((spotSliderMax - spotSliderMin) / 10).round(),
     );
-    final maxDte = math.max(1.0, _initialDte).toDouble();
+    final maxDte = math
+        .max(1.0, _currentDaysToExpiry(widget.state.position.expiry.value))
+        .toDouble();
     final canUseSpot = maxSpot > minSpot;
     double? pnlAtSpot(double spot, {required bool expiry}) {
       var result = 0.0;
@@ -2113,9 +2497,29 @@ class _InteractivePositionPayoffState
             strike: leg.contract.strike.toDouble(),
             isCall: leg.contract.optionType == OptionType.call,
             volPct: _vix,
-            days: _dte,
+            days: _scenarioDaysFor(leg),
           );
-          result += sign * (model.price - entryPremium) * leg.quantity;
+          final liveQuote = _liveOptionPrices[_quoteKey(leg)];
+          final marketSpot = _marketSpot ?? _initialSpot;
+          final marketVol = _marketVix ?? _initialVix;
+          final marketDte =
+              (leg.contract.expiry.value.difference(DateTime.now()).inSeconds /
+                      86400)
+                  .clamp(0.0, 365.0)
+                  .toDouble();
+          final marketModel = _optionModel(
+            spot: marketSpot,
+            strike: leg.contract.strike.toDouble(),
+            isCall: leg.contract.optionType == OptionType.call,
+            volPct: marketVol,
+            days: marketDte,
+          );
+          final scenarioPrice = liveQuote != null
+              ? math
+                    .max(0.0, liveQuote + model.price - marketModel.price)
+                    .toDouble()
+              : model.price;
+          result += sign * (scenarioPrice - entryPremium) * leg.quantity;
         }
       }
       return result;
@@ -2142,7 +2546,7 @@ class _InteractivePositionPayoffState
         ),
         const SizedBox(height: 5),
         const Text(
-          'MTM is a theoretical estimate using Black–Scholes and the VIX slider as an IV proxy—not a live broker quote. Taxes, charges, dividends and volatility skew are excluded.',
+          'Market mode refreshes NIFTY spot, India VIX and available leg quotes every 15 seconds. Scenario MTM re-prices from the latest quote using Black–Scholes; unavailable quotes use a model estimate. Taxes, charges, dividends and volatility skew are excluded.',
           style: TextStyle(fontSize: 12, color: Colors.black54, height: 1.35),
         ),
         if (!_spotWasCaptured || !_vixWasCaptured) ...[
@@ -2152,6 +2556,14 @@ class _InteractivePositionPayoffState
             style: const TextStyle(fontSize: 12, color: Colors.deepOrange),
           ),
         ],
+        const SizedBox(height: 6),
+        Text(
+          '${_scenarioMode ? 'Scenario mode' : 'Market-following mode'} · ${_marketFetchedAt == null ? (_marketStatus ?? 'Waiting for market data') : 'Snapshot ${_marketFetchedAt!.toLocal().toString().substring(0, 19)}'}${_marketStatus == null ? '' : ' · $_marketStatus'}',
+          style: TextStyle(
+            fontSize: 11,
+            color: _scenarioMode ? Colors.deepOrange : Colors.black54,
+          ),
+        ),
         const SizedBox(height: 14),
         _ScenarioSlider(
           label: 'Spot',
@@ -2160,26 +2572,41 @@ class _InteractivePositionPayoffState
           max: spotSliderMax,
           divisions: spotSliderDivisions,
           display: _spot.toStringAsFixed(2),
-          onChanged: (value) => setState(() => _spot = value),
+          onChanged: (value) => setState(() {
+            _scenarioMode = true;
+            _spot = value;
+          }),
           onReset: _resetSpot,
         ),
         _ScenarioSlider(
           label: 'VIX / IV adjustment',
-          value: _vix - _initialVix,
-          // Equal positive/negative movement around the captured IV, limited
-          // by the model's supported 1–100% IV bounds.
-          min: -math.min(_initialVix - 1.0, 100.0 - _initialVix),
-          max: math.min(_initialVix - 1.0, 100.0 - _initialVix),
+          value: _vix - (_marketVix ?? _initialVix),
+          // Volatility adjustment is relative to the latest market baseline.
+          min: -math.min(
+            (_marketVix ?? _initialVix) - 1.0,
+            100.0 - (_marketVix ?? _initialVix),
+          ),
+          max: math.min(
+            (_marketVix ?? _initialVix) - 1.0,
+            100.0 - (_marketVix ?? _initialVix),
+          ),
           divisions: math.max(
             1,
-            (2 * math.min(_initialVix - 1.0, 100.0 - _initialVix)).round(),
+            (2 *
+                    math.min(
+                      (_marketVix ?? _initialVix) - 1.0,
+                      100.0 - (_marketVix ?? _initialVix),
+                    ))
+                .round(),
           ),
           display:
-              '${_vix.toStringAsFixed(1)}% IV (${(_vix - _initialVix) >= 0 ? '+' : ''}${(_vix - _initialVix).toStringAsFixed(1)} pp)',
-          onChanged: (adjustment) => setState(
-            () =>
-                _vix = (_initialVix + adjustment).clamp(1.0, 100.0).toDouble(),
-          ),
+              '${_vix.toStringAsFixed(1)}% IV (${(_vix - (_marketVix ?? _initialVix)) >= 0 ? '+' : ''}${(_vix - (_marketVix ?? _initialVix)).toStringAsFixed(1)} pp)',
+          onChanged: (adjustment) => setState(() {
+            _scenarioMode = true;
+            _vix = ((_marketVix ?? _initialVix) + adjustment)
+                .clamp(1.0, 100.0)
+                .toDouble();
+          }),
           onReset: _resetVix,
         ),
         _ScenarioSlider(
@@ -2190,7 +2617,10 @@ class _InteractivePositionPayoffState
           max: maxDte,
           divisions: math.max(1, maxDte.round()).toInt(),
           display: '${_dte.round()} days',
-          onChanged: (v) => setState(() => _dte = maxDte - v),
+          onChanged: (v) => setState(() {
+            _scenarioMode = true;
+            _dte = maxDte - v;
+          }),
           onReset: _resetDte,
         ),
         Align(
@@ -2918,4 +3348,38 @@ class _PayoffPainter extends CustomPainter {
       capturedSpot != oldDelegate.capturedSpot ||
       textColor != oldDelegate.textColor ||
       lineColor != oldDelegate.lineColor;
+}
+
+/// Shared styling for the four equal-priority position actions.
+class _PositionActionButton extends StatelessWidget {
+  const _PositionActionButton({
+    required this.width,
+    required this.icon,
+    required this.label,
+    required this.onPressed,
+  });
+
+  final double width;
+  final IconData icon;
+  final String label;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+    width: width,
+    height: 52,
+    child: OutlinedButton.icon(
+      onPressed: onPressed,
+      icon: Icon(icon, size: 21),
+      label: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis),
+      style: OutlinedButton.styleFrom(
+        foregroundColor: const Color(0xFF176B87),
+        side: const BorderSide(color: Color(0xFF176B87), width: 1.3),
+        minimumSize: Size(width, 52),
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        shape: const StadiumBorder(),
+        textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+      ),
+    ),
+  );
 }

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -96,6 +97,149 @@ class _PositionsHomeState extends State<PositionsHome> {
   _PositionListMode _listMode = _PositionListMode.open;
   _PositionSortMode _sortMode = _PositionSortMode.lossesFirst;
   String _closedUnderlying = 'All';
+  final Set<String> _expandedPayoffTradeIds = <String>{};
+
+  final Map<String, double> _livePnlByTrade = <String, double>{};
+  final Map<String, DateTime> _livePnlAtByTrade = <String, DateTime>{};
+  Timer? _livePnlTimer;
+  bool _livePnlRefreshInProgress = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // The home screen follows the latest available market quotes without
+    // requiring the user to open each position. Keep the last successful
+    // value when a later refresh fails, and show its timestamp.
+    _refreshLivePnl();
+    _livePnlTimer = Timer.periodic(
+      const Duration(seconds: 15),
+      (_) => _refreshLivePnl(),
+    );
+  }
+
+  @override
+  void dispose() {
+    _livePnlTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _refreshLivePnl() async {
+    if (_livePnlRefreshInProgress || !mounted) return;
+    _livePnlRefreshInProgress = true;
+    try {
+      final token = await MarketDataAuth.readToken();
+      if (token == null || token.isEmpty) return;
+      final trades = await widget.repository.getTrades();
+      final openTrades = trades
+          .where((t) => t.status == TradeStatus.confirmed)
+          .toList();
+      final legsByTrade = <String, List<PositionLeg>>{};
+      final expiryKeys = <String>{};
+      for (final trade in openTrades) {
+        final states = [...trade.positionStates]
+          ..sort((a, b) => a.capturedAt.compareTo(b.capturedAt));
+        if (states.isEmpty || states.last.position.legs.isEmpty) continue;
+        final legs = states.last.position.legs;
+        if (legs.any(
+          (leg) => leg.contract.underlying.toUpperCase() != 'NIFTY',
+        )) {
+          continue; // Current hosted quote endpoint supports NIFTY only.
+        }
+        legsByTrade[trade.id.value] = legs;
+        expiryKeys.addAll(legs.map((leg) => leg.contract.expiry.toString()));
+      }
+      if (expiryKeys.isEmpty) return;
+
+      final quoteByKey = <String, double>{};
+      final quoteTimes = <String, DateTime>{};
+      for (final expiry in expiryKeys) {
+        try {
+          final response = await http
+              .get(
+                Uri.parse(
+                  '$tradingMemoryMarketDataBaseUrl/api/nifty/chain?expiry=$expiry&wing_count=30',
+                ),
+                headers: {
+                  'X-Trading-Memory-Token': token,
+                  'Accept': 'application/json',
+                },
+              )
+              .timeout(const Duration(seconds: 12));
+          if (response.statusCode < 200 || response.statusCode >= 300) continue;
+          final decoded = jsonDecode(response.body);
+          if (decoded is! Map<String, dynamic>) continue;
+          final fetchedAt =
+              DateTime.tryParse(
+                decoded['snapshot_fetched_at']?.toString() ?? '',
+              )?.toLocal() ??
+              DateTime.now();
+          for (final raw in decoded['strikes'] as List<dynamic>? ?? const []) {
+            if (raw is! Map<String, dynamic>) continue;
+            final strike = (raw['strike'] as num?)?.toInt();
+            if (strike == null) continue;
+            for (final tradeLegs in legsByTrade.values) {
+              for (final leg in tradeLegs.where(
+                (leg) =>
+                    leg.contract.expiry.toString() == expiry &&
+                    leg.contract.strike == strike,
+              )) {
+                final sideKey = leg.contract.optionType == OptionType.call
+                    ? 'call'
+                    : 'put';
+                final rawQuote = raw[sideKey];
+                final price = rawQuote is Map<String, dynamic>
+                    ? (rawQuote['last_price'] as num?)?.toDouble()
+                    : null;
+                if (price != null && price.isFinite && price >= 0) {
+                  final key = '$expiry|$strike|${leg.contract.optionType.name}';
+                  quoteByKey[key] = price;
+                  quoteTimes[key] = fetchedAt;
+                }
+              }
+            }
+          }
+        } catch (_) {
+          // Preserve the last successful quote/P&L; never replace it with zero.
+        }
+      }
+
+      final nextPnl = <String, double>{};
+      final nextTimes = <String, DateTime>{};
+      for (final entry in legsByTrade.entries) {
+        var total = 0.0;
+        var complete = true;
+        DateTime? latestQuoteAt;
+        for (final leg in entry.value) {
+          final entryPremium = leg.entryPremium;
+          final key =
+              '${leg.contract.expiry}|${leg.contract.strike}|${leg.contract.optionType.name}';
+          final mark = quoteByKey[key];
+          if (entryPremium == null || mark == null) {
+            complete = false;
+            break;
+          }
+          final sign = leg.side.name == 'buy' ? 1.0 : -1.0;
+          total += (mark - entryPremium) * leg.quantity * sign;
+          final time = quoteTimes[key];
+          if (time != null &&
+              (latestQuoteAt == null || time.isAfter(latestQuoteAt))) {
+            latestQuoteAt = time;
+          }
+        }
+        if (complete && total.isFinite) {
+          nextPnl[entry.key] = total;
+          nextTimes[entry.key] = latestQuoteAt ?? DateTime.now();
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _livePnlByTrade.addAll(nextPnl);
+        _livePnlAtByTrade.addAll(nextTimes);
+      });
+    } finally {
+      _livePnlRefreshInProgress = false;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -147,12 +291,19 @@ class _PositionsHomeState extends State<PositionsHome> {
   }
 
   Future<void> _createPaperTrade() async {
-    await Navigator.of(context).push<void>(
-      MaterialPageRoute<void>(
+    final created = await Navigator.of(context).push<bool>(
+      MaterialPageRoute<bool>(
         builder: (_) => PaperTradeEntryPage(repository: widget.repository),
       ),
     );
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    setState(() {
+      // A successfully confirmed strategy should land on the position list.
+      if (created == true) {
+        _tab = 0;
+        _listMode = _PositionListMode.open;
+      }
+    });
   }
 
   void _showBrokerImportPlaceholder() {
@@ -210,6 +361,10 @@ class _PositionsHomeState extends State<PositionsHome> {
       .reduce((a, b) => a.isBefore(b) ? a : b);
 
   double? _pnlOf(Trade trade) {
+    if (trade.status == TradeStatus.confirmed) {
+      final live = _livePnlByTrade[trade.id.value];
+      if (live != null) return live;
+    }
     final states = [...trade.positionStates]
       ..sort((a, b) => a.capturedAt.compareTo(b.capturedAt));
     final latest = states.isEmpty ? null : states.last;
@@ -489,73 +644,117 @@ class _PositionsHomeState extends State<PositionsHome> {
         borderRadius: BorderRadius.circular(14),
         side: BorderSide(color: border),
       ),
-      child: ListTile(
-        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        title: Row(
-          children: [
-            Expanded(
-              child: Text(
-                underlying,
-                style: const TextStyle(
-                  fontWeight: FontWeight.w800,
-                  fontSize: 16,
-                ),
-              ),
+      child: Column(
+        children: [
+          ListTile(
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 16,
+              vertical: 8,
             ),
-            if (_listMode == _PositionListMode.open)
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                decoration: BoxDecoration(
-                  color: trade.status == TradeStatus.draft
-                      ? const Color(0xFFFFF1E5)
-                      : const Color(0xFFEAF3F6),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Text(
-                  statusLabel,
-                  style: const TextStyle(
-                    fontSize: 10,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-              ),
-          ],
-        ),
-        subtitle: Padding(
-          padding: const EdgeInsets.only(top: 6),
-          child: Text(
-            'Expiry ${_dateLabel(_expiryOf(trade))} · ${trade.strategy.name}'
-            '${pnl != null && trade.status == TradeStatus.confirmed && (trade.positionStates.isEmpty || trade.positionStates.last.economics.pnl == null) ? ' · Last saved marks' : ''}'
-            '${pnl != null && trade.status == TradeStatus.closed && (trade.positionStates.isEmpty || trade.positionStates.last.economics.pnl == null) ? ' · Gross realized estimate' : ''}',
-          ),
-        ),
-        trailing: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.end,
+            title: Row(
               children: [
-                Text(
-                  pnl == null
-                      ? 'P&L unavailable'
-                      : '${isLoss ? '−' : ''}₹${pnl.abs().toStringAsFixed(2)}',
-                  style: TextStyle(
-                    fontWeight: FontWeight.w800,
-                    color: !pnlKnown
-                        ? Colors.black54
-                        : isLoss
-                        ? const Color(0xFFB3261E)
-                        : const Color(0xFF16743B),
+                Expanded(
+                  child: Text(
+                    underlying,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w800,
+                      fontSize: 16,
+                    ),
                   ),
                 ),
-                const SizedBox(height: 4),
-                const Icon(Icons.chevron_right, size: 18),
+                if (_listMode == _PositionListMode.open)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: trade.status == TradeStatus.draft
+                          ? const Color(0xFFFFF1E5)
+                          : const Color(0xFFEAF3F6),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      statusLabel,
+                      style: const TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
               ],
             ),
+            subtitle: Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                'Expiry ${_dateLabel(_expiryOf(trade))} · ${trade.strategy.name}'
+                '${pnl != null && trade.status == TradeStatus.confirmed && _livePnlAtByTrade[trade.id.value] != null ? ' · Last market quote ${_livePnlAtByTrade[trade.id.value]!.toLocal().toString().substring(0, 16)}' : ''}'
+                '${pnl != null && trade.status == TradeStatus.confirmed && _livePnlAtByTrade[trade.id.value] == null && (trade.positionStates.isEmpty || trade.positionStates.last.economics.pnl == null) ? ' · Saved marks (market quote unavailable)' : ''}'
+                '${pnl != null && trade.status == TradeStatus.closed && (trade.positionStates.isEmpty || trade.positionStates.last.economics.pnl == null) ? ' · Gross realized estimate' : ''}',
+              ),
+            ),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Text(
+                      pnl == null
+                          ? 'P&L unavailable'
+                          : '${isLoss ? '−' : ''}₹${pnl.abs().toStringAsFixed(2)}',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w800,
+                        color: !pnlKnown
+                            ? Colors.black54
+                            : isLoss
+                            ? const Color(0xFFB3261E)
+                            : const Color(0xFF16743B),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    const Icon(Icons.chevron_right, size: 18),
+                  ],
+                ),
+              ],
+            ),
+            onTap: () => _openTrade(trade),
+          ),
+          if (_listMode == _PositionListMode.open &&
+              trade.status == TradeStatus.confirmed &&
+              trade.positionStates.isNotEmpty) ...[
+            const Divider(height: 1),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: () {
+                  setState(() {
+                    final id = trade.id.value;
+                    if (!_expandedPayoffTradeIds.add(id)) {
+                      _expandedPayoffTradeIds.remove(id);
+                    }
+                  });
+                },
+                icon: Icon(
+                  _expandedPayoffTradeIds.contains(trade.id.value)
+                      ? Icons.expand_less
+                      : Icons.show_chart,
+                ),
+                label: Text(
+                  _expandedPayoffTradeIds.contains(trade.id.value)
+                      ? 'Hide interactive payoff'
+                      : 'Show interactive payoff',
+                ),
+              ),
+            ),
+            if (_expandedPayoffTradeIds.contains(trade.id.value))
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                child: PositionInteractivePayoffPanel(trade: trade),
+              ),
           ],
-        ),
-        onTap: () => _openTrade(trade),
+        ],
       ),
     );
   }
@@ -1102,7 +1301,12 @@ class _PaperTradeEntryPageState extends State<PaperTradeEntryPage> {
         for (final leg in _legs) {
           final strike = int.tryParse(leg.strike.text);
           if (strike == null) continue;
-          final premium = _templateQuoteFor(chain, strike, leg.optionType);
+          final premium = _templateQuoteFor(
+            chain,
+            strike,
+            leg.optionType,
+            leg.side,
+          );
           if (premium != null) {
             leg.premium.text = premium.toStringAsFixed(2);
             priced++;
@@ -1142,7 +1346,7 @@ class _PaperTradeEntryPageState extends State<PaperTradeEntryPage> {
       final response = await http
           .get(
             Uri.parse(
-              '$tradingMemoryMarketDataBaseUrl/api/nifty/chain?expiry=$key&wing_count=30',
+              '$tradingMemoryMarketDataBaseUrl/api/nifty/chain?expiry=$key&center=$_centerStrike&wing_count=30',
             ),
             headers: {
               'X-Trading-Memory-Token': marketToken,
@@ -1162,16 +1366,35 @@ class _PaperTradeEntryPageState extends State<PaperTradeEntryPage> {
     Map<String, dynamic>? chain,
     int strike,
     OptionType type,
+    ExecutionSide side,
   ) {
+    double? positive(dynamic value) {
+      final parsed = value is num
+          ? value.toDouble()
+          : double.tryParse(value?.toString() ?? '');
+      return parsed != null && parsed.isFinite && parsed > 0 ? parsed : null;
+    }
+
+    int? strikeOf(dynamic value) {
+      if (value is num) return value.toInt();
+      return double.tryParse(value?.toString() ?? '')?.toInt();
+    }
+
     for (final raw in chain?['strikes'] as List<dynamic>? ?? const []) {
-      if (raw is! Map<String, dynamic> ||
-          (raw['strike'] as num?)?.toInt() != strike)
-        continue;
+      if (raw is! Map) continue;
+      if (strikeOf(raw['strike']) != strike) continue;
       final quote = raw[type == OptionType.call ? 'call' : 'put'];
-      final price = quote is Map<String, dynamic>
-          ? (quote['last_price'] as num?)?.toDouble()
-          : null;
-      if (price != null && price.isFinite && price > 0) return price;
+      if (quote is! Map) continue;
+
+      // Prefer LTP, then the executable side of the order book for this leg,
+      // then the opposite side. The price remains empty if no valid quote exists.
+      final ltp = positive(quote['last_price']);
+      if (ltp != null) return ltp;
+      final bid = positive(quote['best_bid']);
+      final ask = positive(quote['best_ask']);
+      final preferred = side == ExecutionSide.buy ? ask : bid;
+      final fallback = side == ExecutionSide.buy ? bid : ask;
+      return preferred ?? fallback;
     }
     return null;
   }
@@ -1375,7 +1598,7 @@ class _PaperTradeEntryPageState extends State<PaperTradeEntryPage> {
           ),
         ),
       );
-      if (confirmed == true && mounted) Navigator.of(context).pop();
+      if (confirmed == true && mounted) Navigator.of(context).pop(true);
     } catch (error) {
       if (mounted)
         setState(
