@@ -1386,11 +1386,21 @@ class _PaperTradeEntryPageState extends State<PaperTradeEntryPage> {
             },
           )
           .timeout(const Duration(seconds: 20));
-      if (response.statusCode < 200 || response.statusCode >= 300) return null;
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception(
+          'Market-data server returned HTTP ${response.statusCode}: ${response.body}',
+        );
+      }
       final decoded = jsonDecode(response.body);
-      return decoded is Map<String, dynamic> ? decoded : null;
-    } catch (_) {
-      return null;
+      if (decoded is Map<String, dynamic>) return decoded;
+      throw Exception('Market-data server response was not a JSON object.');
+    } catch (error) {
+      if (error is TimeoutException) {
+        throw Exception(
+          'Market-data request timed out. Check that the backend is running and reachable.',
+        );
+      }
+      rethrow;
     }
   }
 
@@ -2319,6 +2329,7 @@ class _PaperTradeConfirmationPageState
     // makes FutureBuilder restart on every expand/collapse setState, which can
     // reset the ListView and jump the user back to the top of the page.
     _tradeFuture = widget.repository.getTrade(widget.tradeId);
+    _prefillInitialSnapshotFromMarket();
   }
 
   bool _saving = false;
@@ -2353,7 +2364,341 @@ class _PaperTradeConfirmationPageState
       key: TextEditingController(),
   };
   bool _snapshotFieldsInitialized = false;
-  final Map<String, bool> _expandedSnapshotSections = {};
+  bool _prefillLoading = true;
+  String? _prefillMessage;
+  final Map<String, bool> _expandedSnapshotSections = {
+    'Market context': true,
+    'Breakeven and geometry': true,
+    'Greeks and volatility': true,
+  };
+
+  // Estimate entry-side NSE NIFTY option charges using the current
+  // Zerodha retail fee schedule. This is an estimate, not broker-confirmed
+  // actual charges; exit-side charges are not included at initial entry.
+  double? _estimateEntryCharges(Trade trade) {
+    if (trade.executions.isEmpty) return null;
+
+    const brokeragePerOrder = 20.0;
+    const nseOptionTransactionRate = 0.0003553; // 0.03553% of premium turnover
+    const sebiRate = 10.0 / 10000000.0; // ₹10 per crore
+    const ipftRate = 0.01 / 10000000.0; // ₹0.01 per crore
+    const sellSttRate = 0.0015; // 0.15% on sell-side option premium
+    const buyStampRate = 0.00003; // 0.003% on buy-side premium
+    const gstRate = 0.18;
+
+    double totalTurnover = 0;
+    double sellTurnover = 0;
+    double buyTurnover = 0;
+    for (final execution in trade.executions) {
+      final turnover = execution.quantity * execution.price;
+      if (!turnover.isFinite || turnover < 0) return null;
+      totalTurnover += turnover;
+      if (execution.side == ExecutionSide.sell) {
+        sellTurnover += turnover;
+      } else {
+        buyTurnover += turnover;
+      }
+    }
+
+    // If broker order IDs exist, fills from the same order count as one
+    // brokerage event. Without IDs, conservatively treat each execution as
+    // a separate order because the app cannot know which fills were grouped.
+    final orderIds = <String>{};
+    var executionsWithoutOrderId = 0;
+    for (final execution in trade.executions) {
+      final orderId = execution.brokerOrderId?.trim();
+      if (orderId == null || orderId.isEmpty) {
+        executionsWithoutOrderId++;
+      } else {
+        orderIds.add(orderId);
+      }
+    }
+    final orderCount = orderIds.length + executionsWithoutOrderId;
+    final brokerage = orderCount * brokeragePerOrder;
+    final transactionCharges = totalTurnover * nseOptionTransactionRate;
+    final sebiCharges = totalTurnover * sebiRate;
+    final ipftCharges = totalTurnover * ipftRate;
+    final stt = sellTurnover * sellSttRate;
+    final stampDuty = buyTurnover * buyStampRate;
+    final gst =
+        (brokerage + transactionCharges + sebiCharges + ipftCharges) * gstRate;
+    final estimate =
+        brokerage +
+        transactionCharges +
+        sebiCharges +
+        ipftCharges +
+        stt +
+        stampDuty +
+        gst;
+    return estimate.isFinite ? estimate : null;
+  }
+
+  /// Requests read-only hypothetical margin and charges from the local Kite
+  /// backend. Null fields mean Kite could not calculate that value; they are
+  /// never converted to zero. This endpoint does not place orders.
+  Future<Map<String, double?>> _fetchBrokerEstimate(Trade trade) async {
+    final result = <String, double?>{'margin': null, 'cost': null};
+    if (trade.executions.isEmpty ||
+        trade.executions.any(
+          (e) => !e.contract.underlying.toUpperCase().contains('NIFTY'),
+        )) {
+      return result;
+    }
+    final token = await MarketDataAuth.readToken();
+    if (token == null || token.isEmpty) return result;
+
+    String isoDate(DateTime value) =>
+        '${value.year.toString().padLeft(4, '0')}-${value.month.toString().padLeft(2, '0')}-${value.day.toString().padLeft(2, '0')}';
+    final firstExpiry = trade.executions.first.contract.expiry.value;
+    final legs = trade.executions
+        .map(
+          (execution) => <String, dynamic>{
+            'expiry': isoDate(execution.contract.expiry.value),
+            'strike': execution.contract.strike,
+            'option_type': execution.contract.optionType == OptionType.call
+                ? 'CE'
+                : 'PE',
+            'side': execution.side == ExecutionSide.buy ? 'BUY' : 'SELL',
+            'quantity': execution.quantity,
+            'entry_price': execution.price,
+          },
+        )
+        .toList();
+    try {
+      final response = await http
+          .post(
+            Uri.parse(
+              '$tradingMemoryMarketDataBaseUrl/api/nifty/position-estimate',
+            ),
+            headers: {
+              'X-Trading-Memory-Token': token,
+              'Accept': 'application/json',
+              'Content-Type': 'application/json',
+            },
+            body: jsonEncode({'expiry': isoDate(firstExpiry), 'legs': legs}),
+          )
+          .timeout(const Duration(seconds: 25));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return result;
+      }
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map) return result;
+      final margin = decoded['margin'];
+      if (margin is Map) {
+        final finalMargin = margin['final'];
+        final initialMargin = margin['initial'];
+        final value = finalMargin is num
+            ? finalMargin.toDouble()
+            : initialMargin is num
+            ? initialMargin.toDouble()
+            : null;
+        if (value != null && value.isFinite && value >= 0) {
+          result['margin'] = value;
+        }
+      }
+      final charges = decoded['charges'];
+      if (charges is Map && charges['total'] is num) {
+        final value = (charges['total'] as num).toDouble();
+        if (value.isFinite && value >= 0) result['cost'] = value;
+      }
+    } catch (_) {
+      // Keep values unavailable; the local entry-only estimate remains a
+      // separate fallback for charges. Never block position capture on Kite.
+    }
+    return result;
+  }
+
+  Future<void> _prefillInitialSnapshotFromMarket() async {
+    if (mounted)
+      setState(() {
+        _prefillLoading = true;
+        _prefillMessage = null;
+      });
+    try {
+      final trade = await _tradeFuture;
+      if (trade == null || trade.executions.isEmpty) {
+        if (mounted)
+          setState(() {
+            _prefillLoading = false;
+            _prefillMessage = 'Add at least one saved leg before market values can be calculated.';
+          });
+        return;
+      }
+      final chain = await _fetchCaptureChain(trade);
+      if (chain == null || !mounted) {
+        if (mounted)
+          setState(() {
+            _prefillLoading = false;
+            _prefillMessage = 'No option-chain response was available. Confirm this is a NIFTY position, pair the app with the market-data server, verify Zerodha is connected, and confirm the trade expiry is available; then tap refresh.';
+          });
+        return;
+      }
+      double? number(dynamic value) {
+        if (value is num) return value.toDouble();
+        if (value is String)
+          return double.tryParse(value.replaceAll(',', '').trim());
+        return null;
+      }
+
+      final spot = number(
+        chain['spot'] ?? chain['spot_price'] ?? chain['underlying_price'],
+      );
+      final vix = number(
+        chain['india_vix'] ?? chain['vix'] ?? chain['indiaVix'],
+      );
+      final rows = (chain['strikes'] as List<dynamic>? ?? const [])
+          .whereType<Map>()
+          .map((row) => Map<String, dynamic>.from(row))
+          .where((row) => number(row['strike']) != null && spot != null)
+          .toList();
+      if (spot != null) {
+        rows.sort(
+          (a, b) => (number(a['strike'])! - spot).abs().compareTo(
+            (number(b['strike'])! - spot).abs(),
+          ),
+        );
+      }
+      final atm = rows.isEmpty ? null : rows.first;
+      final callQuote = atm?['call'];
+      final putQuote = atm?['put'];
+      final call = callQuote is Map
+          ? number(callQuote['last_price'] ?? callQuote['ltp'])
+          : null;
+      final put = putQuote is Map
+          ? number(putQuote['last_price'] ?? putQuote['ltp'])
+          : null;
+      final straddle = call != null && put != null && call > 0 && put > 0
+          ? call + put
+          : null;
+      final estimatedEntryCharges = _estimateEntryCharges(trade);
+      final List<PositionLeg> legs = <PositionLeg>[
+        for (final e in trade.executions)
+          PositionLeg(
+            contract: e.contract,
+            side: e.side == ExecutionSide.buy
+                ? PositionSide.buy
+                : PositionSide.sell,
+            quantity: e.quantity,
+            entryPremium: e.price,
+          ),
+      ];
+      final metrics = _expiryMetrics(legs, spot);
+      final brokerEstimate = await _fetchBrokerEstimate(trade);
+      void fill(String key, double? value) {
+        final controller = _snapshotFields[key];
+        if (controller != null &&
+            controller.text.trim().isEmpty &&
+            value != null &&
+            value.isFinite) {
+          controller.text = _formatMetric(value);
+        }
+      }
+
+      setState(() {
+        fill('spot', spot);
+        fill('vix', vix);
+        fill('atmStraddle', straddle);
+        fill('cost', brokerEstimate['cost'] ?? estimatedEntryCharges);
+        fill('margin', brokerEstimate['margin']);
+        fill('lowerBreakeven', metrics['lower']);
+        fill('upperBreakeven', metrics['upper']);
+        fill('wingWidth', metrics['width']);
+        fill('distanceToLowerBreakeven', metrics['lowerDistance']);
+        fill('distanceToUpperBreakeven', metrics['upperDistance']);
+        fill('maxProfit', metrics['maxProfit']);
+        fill('maxLoss', metrics['maxLoss']);
+        // IV is populated only from actual per-leg implied-volatility quotes;
+        // India VIX is market context and is not substituted for option IV.
+        double ivTotal = 0;
+        var ivCount = 0;
+        for (final leg in trade.executions) {
+          Map<String, dynamic>? matchingRow;
+          for (final candidate in rows) {
+            if (number(candidate['strike'])?.round() == leg.contract.strike) {
+              matchingRow = candidate;
+              break;
+            }
+          }
+          final quote =
+              matchingRow?[leg.contract.optionType == OptionType.call
+                  ? 'call'
+                  : 'put'];
+          if (quote is Map &&
+              number(quote['implied_volatility'] ?? quote['iv']) != null) {
+            ivTotal += number(quote['implied_volatility'] ?? quote['iv'])!;
+            ivCount++;
+          }
+        }
+        if (ivCount > 0) fill('iv', ivTotal / ivCount);
+        // Aggregate Greeks are populated only when the provider actually supplies
+        // per-leg Greek values; do not manufacture values from VIX alone.
+        final greekKeys = {
+          'delta': 'delta',
+          'gamma': 'gamma',
+          'theta': 'theta',
+          'vega': 'vega',
+        };
+        for (final entry in greekKeys.entries) {
+          double total = 0;
+          var found = false;
+          for (final leg in trade.executions) {
+            Map<String, dynamic>? matchingRow;
+            for (final candidate in rows) {
+              if (number(candidate['strike'])?.round() == leg.contract.strike) {
+                matchingRow = candidate;
+                break;
+              }
+            }
+            final quote =
+                matchingRow?[leg.contract.optionType == OptionType.call
+                    ? 'call'
+                    : 'put'];
+            if (quote is Map && number(quote[entry.value]) != null) {
+              final value = number(quote[entry.value])!;
+              total +=
+                  (leg.side == ExecutionSide.buy ? 1 : -1) *
+                  value *
+                  leg.quantity;
+              found = true;
+            }
+          }
+          if (found) fill(entry.key, total);
+        }
+        _prefillLoading = false;
+        final populated = <String>[
+          'spot',
+          'vix',
+          'atmStraddle',
+        ].where((key) => _snapshotFields[key]!.text.trim().isNotEmpty).length;
+        final filled = <String>[
+          if (_snapshotFields['spot']!.text.trim().isNotEmpty) 'spot',
+          if (_snapshotFields['vix']!.text.trim().isNotEmpty) 'VIX',
+          if (_snapshotFields['atmStraddle']!.text.trim().isNotEmpty)
+            'ATM straddle',
+          if (_snapshotFields['distanceToLowerBreakeven']!.text
+              .trim()
+              .isNotEmpty)
+            'lower breakeven distance',
+          if (_snapshotFields['distanceToUpperBreakeven']!.text
+              .trim()
+              .isNotEmpty)
+            'upper breakeven distance',
+        ];
+        final chargesStatus = estimatedEntryCharges == null
+            ? 'Entry charges unavailable'
+            : 'estimated entry charges';
+        _prefillMessage = filled.isEmpty
+            ? 'The server responded, but its option-chain data did not include usable spot/VIX/ATM prices. $chargesStatus calculated locally; margin needs broker margin data.'
+            : 'Prefilled: ${filled.join(', ')}. $chargesStatus calculated locally (exit charges excluded); margin needs broker margin data.';
+      });
+    } catch (error) {
+      if (mounted)
+        setState(() {
+          _prefillLoading = false;
+          _prefillMessage = 'Could not prefill market values: $error';
+        });
+    }
+  }
 
   double? _fieldValue(String key, double? fallback) {
     final text = _snapshotFields[key]?.text.trim() ?? '';
@@ -2368,25 +2713,23 @@ class _PaperTradeConfirmationPageState
   void _initializeSnapshotFields(Trade trade) {
     if (_snapshotFieldsInitialized) return;
     _snapshotFieldsInitialized = true;
-    final legs = trade.executions
-        .map(
-          (e) => PositionLeg(
-            contract: e.contract,
-            side: e.side == ExecutionSide.buy
-                ? PositionSide.buy
-                : PositionSide.sell,
-            quantity: e.quantity,
-            entryPremium: e.price,
-          ),
-        )
-        .toList();
+    final List<PositionLeg> legs = <PositionLeg>[
+      for (final e in trade.executions)
+        PositionLeg(
+          contract: e.contract,
+          side: e.side == ExecutionSide.buy
+              ? PositionSide.buy
+              : PositionSide.sell,
+          quantity: e.quantity,
+          entryPremium: e.price,
+        ),
+    ];
     final metrics = _expiryMetrics(legs, null);
     final initial = <String, double?>{
       'entryDebitCredit': trade.netPremium,
       'lowerBreakeven': metrics['lower'],
       'upperBreakeven': metrics['upper'],
       'wingWidth': metrics['width'],
-      'profitRange': metrics['range'],
       'maxProfit': metrics['maxProfit'],
       'maxLoss': metrics['maxLoss'],
     };
@@ -2579,7 +2922,9 @@ class _PaperTradeConfirmationPageState
   Future<Map<String, dynamic>?> _fetchCaptureChain(Trade trade) async {
     final marketToken = await MarketDataAuth.readToken();
     if (trade.executions.isEmpty ||
-        trade.executions.first.contract.underlying != 'NIFTY' ||
+        !trade.executions.first.contract.underlying.toUpperCase().contains(
+          'NIFTY',
+        ) ||
         marketToken == null ||
         marketToken.isEmpty)
       return null;
@@ -2598,11 +2943,21 @@ class _PaperTradeConfirmationPageState
             },
           )
           .timeout(const Duration(seconds: 20));
-      if (response.statusCode < 200 || response.statusCode >= 300) return null;
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception(
+          'Market-data server returned HTTP ${response.statusCode}: ${response.body}',
+        );
+      }
       final decoded = jsonDecode(response.body);
-      return decoded is Map<String, dynamic> ? decoded : null;
-    } catch (_) {
-      return null;
+      if (decoded is Map<String, dynamic>) return decoded;
+      throw Exception('Market-data server response was not a JSON object.');
+    } catch (error) {
+      if (error is TimeoutException) {
+        throw Exception(
+          'Market-data request timed out. Check that the backend is running and reachable.',
+        );
+      }
+      rethrow;
     }
   }
 
@@ -2673,8 +3028,23 @@ class _PaperTradeConfirmationPageState
     }
     if (values.last == 0) roots.add(points.last);
     roots.sort();
-    final lower = roots.isEmpty ? null : roots.first;
-    final upper = roots.length < 2 ? null : roots.last;
+    // A one-breakeven position (for example, a bull put spread) must not
+    // automatically be labelled as having a lower breakeven. Classify its
+    // single root relative to the captured spot: above spot => upper BE;
+    // below spot => lower BE. If spot is not known yet, leave the single BE
+    // unclassified until market context is fetched.
+    double? lower;
+    double? upper;
+    if (roots.length >= 2) {
+      lower = roots.first;
+      upper = roots.last;
+    } else if (roots.length == 1 && spot != null) {
+      if (roots.single >= spot) {
+        upper = roots.single;
+      } else {
+        lower = roots.single;
+      }
+    }
     final maxValue = values.reduce((a, b) => a > b ? a : b),
         minValue = values.reduce((a, b) => a < b ? a : b);
     final shortCallQuantity = legs
@@ -2729,10 +3099,27 @@ class _PaperTradeConfirmationPageState
       }
       final now = DateTime.now();
       final first = trade.executions.first;
+      final estimatedEntryCharges = _estimateEntryCharges(trade);
+      if (_snapshotFields['cost']!.text.trim().isEmpty &&
+          estimatedEntryCharges != null) {
+        _snapshotFields['cost']!.text = _formatMetric(estimatedEntryCharges);
+      }
       // Resolve the market snapshot before changing the draft's status. A
       // missing spot must not leave a confirmed position without its first
       // point-in-time spot value.
       final captureChain = await _fetchCaptureChain(trade);
+      final brokerEstimate = await _fetchBrokerEstimate(trade);
+      if (_snapshotFields['cost']!.text.trim().isEmpty) {
+        final charges = brokerEstimate['cost'] ?? estimatedEntryCharges;
+        if (charges != null)
+          _snapshotFields['cost']!.text = _formatMetric(charges);
+      }
+      if (_snapshotFields['margin']!.text.trim().isEmpty &&
+          brokerEstimate['margin'] != null) {
+        _snapshotFields['margin']!.text = _formatMetric(
+          brokerEstimate['margin'],
+        );
+      }
       final capturedSpot = (captureChain?['spot'] as num?)?.toDouble();
       final capturedVix = (captureChain?['india_vix'] as num?)?.toDouble();
       final spotAtCapture = _fieldValue('spot', capturedSpot);
@@ -2773,20 +3160,6 @@ class _PaperTradeConfirmationPageState
             ),
           )
           .toList();
-      final allLegPricesAvailable = snapshotLegs.every(
-        (leg) => leg.marketPrice != null,
-      );
-      final mtmPnl = allLegPricesAvailable
-          ? snapshotLegs.fold<double>(
-              0,
-              (sum, leg) =>
-                  sum +
-                  (leg.side == PositionSide.buy
-                          ? leg.marketPrice! - leg.entryPremium!
-                          : leg.entryPremium! - leg.marketPrice!) *
-                      leg.quantity,
-            )
-          : null;
       final rows = (captureChain?['strikes'] as List<dynamic>? ?? const [])
           .whereType<Map<String, dynamic>>()
           .where((row) => row['strike'] is num && capturedSpot != null)
@@ -2851,14 +3224,14 @@ class _PaperTradeConfirmationPageState
             'distanceToUpperBreakeven',
             metrics['upperDistance'],
           ),
-          profitRange: _fieldValue('profitRange', metrics['range']),
+          profitRange: null,
         ),
         economics: EconomicSnapshot(
-          pnl: _fieldValue('pnl', mtmPnl),
-          pnlPercentage: _fieldValue('pnlPercentage', null),
-          capitalDeployed: _fieldValue('capitalDeployed', null),
+          pnl: null,
+          pnlPercentage: null,
+          capitalDeployed: null,
           margin: _fieldValue('margin', null),
-          cost: _fieldValue('cost', null),
+          cost: _fieldValue('cost', estimatedEntryCharges),
         ),
         risk: RiskSnapshot(
           maxProfit: _fieldValue('maxProfit', metrics['maxProfit']),
@@ -3000,10 +3373,41 @@ class _PaperTradeConfirmationPageState
                         ),
                       ]),
                       _snapshotSection('Market context', [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                _prefillLoading
+                                    ? 'Fetching market values…'
+                                    : (_prefillMessage ??
+                                          'Market values can be refreshed.'),
+                                style: const TextStyle(
+                                  color: Colors.black54,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ),
+                            IconButton(
+                              tooltip: 'Refresh market values',
+                              onPressed: _prefillLoading
+                                  ? null
+                                  : _prefillInitialSnapshotFromMarket,
+                              icon: _prefillLoading
+                                  ? const SizedBox(
+                                      width: 18,
+                                      height: 18,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    )
+                                  : const Icon(Icons.refresh),
+                            ),
+                          ],
+                        ),
                         _metricField(
                           'spot',
                           'Spot price',
-                          helper: 'Prefilled from Zerodha at confirmation when available',
+                          helper: 'Fetched from the option-chain API; editable',
                         ),
                         _metricField('vix', 'India VIX'),
                         _metricField('atmStraddle', 'ATM straddle price'),
@@ -3020,7 +3424,6 @@ class _PaperTradeConfirmationPageState
                           'distanceToUpperBreakeven',
                           'Spot distance to upper breakeven',
                         ),
-                        _metricField('profitRange', 'Breakeven profit range'),
                       ]),
                       _snapshotSection('Risk and payoff', [
                         _metricField('maxProfit', 'Maximum profit'),
@@ -3032,11 +3435,16 @@ class _PaperTradeConfirmationPageState
                         _riskRewardField(),
                       ]),
                       _snapshotSection('Position economics', [
-                        _metricField('pnl', 'Unrealized P&L / MTM'),
-                        _metricField('pnlPercentage', 'P&L percentage'),
-                        _metricField('capitalDeployed', 'Capital deployed'),
-                        _metricField('margin', 'Margin'),
-                        _metricField('cost', 'Charges / costs'),
+                        _metricField(
+                          'margin',
+                          'Margin',
+                          helper: 'Requires a broker margin calculation for the complete position; not inferred from option quotes.',
+                        ),
+                        _metricField(
+                          'cost',
+                          'Charges / costs',
+                          helper: 'Locally estimated entry charges; excludes exit-side charges. Replace with broker-confirmed actuals when available.',
+                        ),
                       ]),
                       _snapshotSection('Greeks and volatility', [
                         _metricField('delta', 'Delta'),

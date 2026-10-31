@@ -166,12 +166,26 @@ class _AdjustmentAssistantPageState extends State<AdjustmentAssistantPage> {
       limit: 100000,
       minimumScore: 0.35,
     );
-    final similarStateKeys = matches
-        .map((match) => '${match.trade.id.value}:${match.state.id.value}')
+    // Once one state in a closed trade is a genuine structural/context match,
+    // retain that trade's full subsequent transition chain. Otherwise a current
+    // Bear Call Spread may find the opening state but lose the later steps that
+    // converted it to an Iron Condor and eventually closed it.
+    final relevantTradeIds = matches
+        .map((match) => match.trade.id.value)
         .toSet();
+    final similarityByTrade = <String, double>{};
+    for (final match in matches) {
+      final id = match.trade.id.value;
+      final prior = similarityByTrade[id] ?? 0.0;
+      if (match.score > prior) similarityByTrade[id] = match.score;
+    }
     final current = widget.state.position;
     final results = _episodes.where((episode) {
       if (episode.tradeId == widget.trade.id.value) return false;
+
+      // Explicit adjustment records and snapshot-inferred transitions are both
+      // useful evidence, but they are not equivalent. Keep inferred transitions
+      // eligible as lower-confidence precedents and label them clearly in the UI.
       if (episode.afterPositionStateId == null) return false;
       if (episode.status != AdjustmentEpisodeStatus.applied &&
           episode.status != AdjustmentEpisodeStatus.partiallyApplied) {
@@ -186,15 +200,14 @@ class _AdjustmentAssistantPageState extends State<AdjustmentAssistantPage> {
       // current Iron Condor resembles the AFTER state of a closed trade that
       // started as a Bull Put Spread and later added call legs.
       if (!_hasLegChange(before, after)) return false;
-      final beforeMatches = similarStateKeys.contains(
-        '${episode.tradeId}:${episode.beforePositionStateId}',
-      );
-      final afterMatches = similarStateKeys.contains(
-        '${episode.tradeId}:${episode.afterPositionStateId}',
-      );
-      return (beforeMatches || afterMatches) &&
+      final sameUnderlying =
           before.position.underlying.toUpperCase() ==
-              current.underlying.toUpperCase();
+          current.underlying.toUpperCase();
+      // A structurally/contextually similar state makes this closed trade
+      // relevant; include its later transitions too, so the full adjustment
+      // journey remains visible even when later states no longer resemble the
+      // current position.
+      return sameUnderlying && relevantTradeIds.contains(episode.tradeId);
     }).toList();
     results.sort((a, b) {
       final aTrade = _trades[a.tradeId];
@@ -208,6 +221,14 @@ class _AdjustmentAssistantPageState extends State<AdjustmentAssistantPage> {
       final aSameStrategy = aState?.position.strategy == currentStrategy;
       final bSameStrategy = bState?.position.strategy == currentStrategy;
       if (aSameStrategy != bSameStrategy) return aSameStrategy ? -1 : 1;
+      final scoreOrder = (similarityByTrade[b.tradeId] ?? 0.0).compareTo(
+        similarityByTrade[a.tradeId] ?? 0.0,
+      );
+      if (scoreOrder != 0) return scoreOrder;
+      if (a.tradeId == b.tradeId) {
+        // Show the historical journey in the order it happened.
+        return a.createdAt.compareTo(b.createdAt);
+      }
       return b.createdAt.compareTo(a.createdAt);
     });
     return List.unmodifiable(results);
@@ -475,7 +496,7 @@ class _AdjustmentAssistantPageState extends State<AdjustmentAssistantPage> {
           ),
           const SizedBox(height: 4),
           Text(
-            'Historical transitions include added, removed, and quantity-changed legs from similar states in closed trades. Saved adjustment records are preferred; missing records are inferred from consecutive snapshots and labelled as inferred.',
+            'Recorded adjustments are shown separately from transitions inferred from saved snapshots. An inferred transition can help explore what changed, but does not prove which decision you made.',
             style: theme.textTheme.bodySmall,
           ),
           const SizedBox(height: 10),
@@ -498,12 +519,12 @@ class _AdjustmentAssistantPageState extends State<AdjustmentAssistantPage> {
                     const Icon(Icons.history_toggle_off, size: 28),
                     const SizedBox(height: 8),
                     Text(
-                      'No matching historical adjustments yet',
+                      'No matching historical transitions yet',
                       style: theme.textTheme.titleMedium,
                     ),
                     const SizedBox(height: 4),
                     const Text(
-                      'There are no applied adjustment records with linked before-and-after snapshots for this underlying. Record your actual decisions as you trade; they can become future examples.',
+                      'No structurally matching historical transition was found. Similar positions alone do not establish an adjustment; saved decision records make historical precedents more reliable.',
                     ),
                   ],
                 ),
@@ -524,7 +545,11 @@ class _AdjustmentAssistantPageState extends State<AdjustmentAssistantPage> {
                   children: [
                     ListTile(
                       contentPadding: EdgeInsets.zero,
-                      title: const Text('Historical adjustment selected'),
+                      title: Text(
+                        _isInferredEpisode(selected)
+                            ? 'Historical transition selected · inferred'
+                            : 'Historical adjustment selected · recorded',
+                      ),
                       subtitle: Text(
                         'Source trade ${selected.tradeId} · ${selected.createdAt.toLocal()}\n${_reasonFor(selected)}',
                       ),
@@ -537,7 +562,7 @@ class _AdjustmentAssistantPageState extends State<AdjustmentAssistantPage> {
                       initiallyExpanded: false,
                       tilePadding: EdgeInsets.zero,
                       childrenPadding: const EdgeInsets.only(bottom: 12),
-                      title: const Text('Before adjustment · current position'),
+                      title: const Text('Before transition · current position'),
                       subtitle: const Text(
                         'Current legs, risk context and interactive payoff',
                       ),
@@ -562,7 +587,7 @@ class _AdjustmentAssistantPageState extends State<AdjustmentAssistantPage> {
                       tilePadding: EdgeInsets.zero,
                       childrenPadding: const EdgeInsets.only(bottom: 12),
                       title: const Text(
-                        'After adjustment · simulated position',
+                        'After transition · simulated position',
                       ),
                       subtitle: const Text(
                         'Adjusted legs, risk context and separate interactive payoff',
@@ -660,8 +685,9 @@ class _AdjustmentAssistantPageState extends State<AdjustmentAssistantPage> {
                       sourcePositionStateId: widget.state.id.value,
                       perspective: MarketView.uncertain,
                       title: 'Historical position transition',
-                      explanation:
-                          'Based on historical episode ${selected.id}. Review every added, reduced, exited, or increased leg and its price before confirming. This does not execute a trade.',
+                      explanation: _isInferredEpisode(selected)
+                          ? 'Based on a transition inferred from consecutive snapshots in historical episode ${selected.id}; the original decision was not explicitly recorded. Treat this as a hypothesis, verify the market context and review every leg and price before confirming. This does not execute a trade.'
+                          : 'Based on explicitly recorded historical episode ${selected.id}. Review every added, reduced, exited, or increased leg and its price before confirming. This does not execute a trade.',
                       operations: operations,
                       precedentEpisodeIds: [selected.id],
                       createdAt: DateTime.now(),
@@ -745,6 +771,13 @@ class _AdjustmentAssistantPageState extends State<AdjustmentAssistantPage> {
   String _legKey(PositionLeg leg) =>
       '${leg.contract.underlying}|${leg.contract.expiry}|${leg.contract.strike}|${leg.contract.optionType.name}|${leg.side.name}';
 
+  bool _isInferredEpisode(AdjustmentEpisode episode) {
+    final note = episode.reasonNote?.toLowerCase() ?? '';
+    return episode.id.startsWith('derived-') ||
+        note.contains('inferred from consecutive saved snapshots') ||
+        note.contains('not an explicitly recorded adjustment');
+  }
+
   Widget _historicalOptionCard(
     BuildContext context,
     AdjustmentEpisode episode,
@@ -789,7 +822,9 @@ class _AdjustmentAssistantPageState extends State<AdjustmentAssistantPage> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          action == null
+                          _isInferredEpisode(episode)
+                              ? 'Snapshot-inferred transition'
+                              : action == null
                               ? episode.reason.label
                               : _actionLabel(action),
                           style: theme.textTheme.titleMedium,
@@ -799,6 +834,17 @@ class _AdjustmentAssistantPageState extends State<AdjustmentAssistantPage> {
                           'Source trade ${episode.tradeId} · ${episode.createdAt.toLocal()}',
                           style: theme.textTheme.bodySmall,
                         ),
+                        if (_isInferredEpisode(episode))
+                          Padding(
+                            padding: const EdgeInsets.only(top: 4),
+                            child: Text(
+                              'Inferred from snapshots · decision not recorded',
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.tertiary,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
                       ],
                     ),
                   ),

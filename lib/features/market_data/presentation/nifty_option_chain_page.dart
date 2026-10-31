@@ -52,6 +52,7 @@ class NiftyOptionChainPage extends StatefulWidget {
     this.initialExpiry,
     this.initialSelections = const [],
     this.existingLegs = const [],
+    this.existingOnly = false,
   });
 
   final DateTime? initialExpiry;
@@ -59,6 +60,10 @@ class NiftyOptionChainPage extends StatefulWidget {
 
   /// Existing position legs shown as read-only context; never returned as new selections.
   final List<NiftyOptionContractSelection> existingLegs;
+
+  /// When true, the chain edits the supplied selections only. It cannot add,
+  /// remove, or change the side of existing position legs.
+  final bool existingOnly;
 
   @override
   State<NiftyOptionChainPage> createState() => _NiftyOptionChainPageState();
@@ -100,12 +105,19 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
   Future<Map<String, dynamic>> _getJson(String path) async {
     final token = await MarketDataAuth.readToken();
     if (token == null || token.isEmpty) {
-      throw const _MarketDataException('Pair this installation with the market-data server below first.');
+      throw const _MarketDataException(
+        'Pair this installation with the market-data server below first.',
+      );
     }
-    final response = await http.get(
-      Uri.parse('$tradingMemoryMarketDataBaseUrl$path'),
-      headers: {'X-Trading-Memory-Token': token, 'Accept': 'application/json'},
-    ).timeout(const Duration(seconds: 30));
+    final response = await http
+        .get(
+          Uri.parse('$tradingMemoryMarketDataBaseUrl$path'),
+          headers: {
+            'X-Trading-Memory-Token': token,
+            'Accept': 'application/json',
+          },
+        )
+        .timeout(const Duration(seconds: 30));
     dynamic decoded;
     try {
       decoded = jsonDecode(response.body);
@@ -223,7 +235,9 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
           final currentQuantity = int.tryParse(
             leg.quantityController.text.trim(),
           );
-          if (currentQuantity == 1 && actualLotSize > 1) {
+          if (!widget.existingOnly &&
+              currentQuantity == 1 &&
+              actualLotSize > 1) {
             // A default quantity of one is not a valid NIFTY option lot.
             leg.quantityController.text = '$actualLotSize';
           }
@@ -278,6 +292,20 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
   ) {
     final expiry = _selectedExpiry;
     if (expiry == null) return;
+    if (widget.existingOnly) return;
+    final alreadyInPosition = widget.existingLegs.any(
+      (leg) =>
+          leg.strike == strike &&
+          leg.optionType == type &&
+          _sameDate(leg.expiry, expiry),
+    );
+    if (alreadyInPosition) {
+      _showMessage(
+        'This contract is already in the position. Use Edit legs to correct its quantity, or Exit legs to close it.',
+        error: true,
+      );
+      return;
+    }
     final symbol = contract['tradingsymbol']?.toString() ?? '';
     final existingIndex = _selectedLegs.indexWhere(
       (leg) =>
@@ -328,32 +356,16 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
   }
 
   Future<void> _changeExpiry(DateTime? value) async {
+    if (widget.existingOnly) return;
     if (value == null || _sameDate(value, _selectedExpiry!)) return;
     if (_selectedLegs.isNotEmpty) {
-      final clear = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: const Text('Change expiry?'),
-          content: const Text(
-            'All legs in one trade must use the same expiry. Changing expiry will clear the current chain selections.',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Keep current expiry'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Clear and switch'),
-            ),
-          ],
-        ),
-      );
-      if (clear != true || !mounted) return;
       for (final leg in _selectedLegs) {
         leg.dispose();
       }
       _selectedLegs.clear();
+      _showMessage(
+        'Selections were cleared because all legs in a trade must use the same expiry.',
+      );
     }
     setState(() {
       _selectedExpiry = value;
@@ -367,7 +379,7 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
     leg.dispose();
   }
 
-  void _finishSelection() {
+  Future<void> _finishSelection() async {
     final result = <NiftyOptionContractSelection>[];
     for (final leg in _selectedLegs) {
       final enteredQuantity = int.tryParse(leg.quantityController.text.trim());
@@ -414,6 +426,26 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
         ),
       );
     }
+    if (widget.existingOnly &&
+        result.length != widget.initialSelections.length) {
+      _showMessage(
+        'Existing-leg editing cannot add or remove contracts.',
+        error: true,
+      );
+      return;
+    }
+    if (result.isEmpty) {
+      if (widget.existingOnly) {
+        _showMessage(
+          'At least one existing leg must remain. Use Exit legs to close a position.',
+          error: true,
+        );
+        return;
+      }
+      Navigator.of(context).pop(result);
+      return;
+    }
+
     Navigator.of(context).pop(result);
   }
 
@@ -432,6 +464,11 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
       appBar: AppBar(
         title: const Text('NIFTY option chain'),
         actions: [
+          if (!_loading && _connected && _expiries.isNotEmpty)
+            TextButton(
+              onPressed: _loadingChain ? null : _finishSelection,
+              child: const Text('Done'),
+            ),
           IconButton(
             tooltip: 'Refresh quotes',
             onPressed: _loading || _loadingChain ? null : () => _loadChain(),
@@ -470,9 +507,11 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
                         in (_chain!['strikes'] as List<dynamic>? ?? []))
                       _strikeRow(row as Map<String, dynamic>),
                     const SizedBox(height: 12),
-                    const Text(
-                      'Tap BUY or SELL directly on a call or put to add it. Select multiple legs, adjust quantity and entry premium below, then tap Done. LTP is a quote reference, not an executed fill.',
-                      style: TextStyle(
+                    Text(
+                      widget.existingOnly
+                          ? 'Edit the quantities and entry premiums for the existing legs below. Contracts and sides are locked in this mode; use Add legs or Exit legs for actual position changes.'
+                          : 'Tap BUY or SELL directly on a call or put to add it. Adjust lots/quantity and entry premium below, remove unwanted selections, review the final selection, then tap Done. Only the confirmed new selections are added. LTP is a quote reference, not an executed fill.',
+                      style: const TextStyle(
                         color: Colors.black54,
                         fontSize: 12,
                         height: 1.4,
@@ -504,7 +543,10 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
 
   Future<void> _pairDevice() async {
     if (_pairing) return;
-    setState(() { _pairing = true; _error = null; });
+    setState(() {
+      _pairing = true;
+      _error = null;
+    });
     try {
       await MarketDataAuth.enroll(
         baseUrl: tradingMemoryMarketDataBaseUrl,
@@ -513,12 +555,17 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
       _pairingCodeController.clear();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('This installation is paired securely.')),
+          const SnackBar(
+            content: Text('This installation is paired securely.'),
+          ),
         );
       }
       await _initialize();
     } catch (error) {
-      if (mounted) setState(() => _error = error.toString().replaceFirst('Exception: ', ''));
+      if (mounted)
+        setState(
+          () => _error = error.toString().replaceFirst('Exception: ', ''),
+        );
     } finally {
       if (mounted) setState(() => _pairing = false);
     }
@@ -527,24 +574,37 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
   Future<void> _openZerodhaLogin() async {
     try {
       final token = await MarketDataAuth.readToken();
-      if (token == null || token.isEmpty) throw StateError('Pair this installation first.');
-      final ticketResponse = await http.post(
-        Uri.parse('$tradingMemoryMarketDataBaseUrl/api/kite/login-ticket'),
-        headers: {'X-Trading-Memory-Token': token, 'Accept': 'application/json'},
-      ).timeout(const Duration(seconds: 15));
+      if (token == null || token.isEmpty)
+        throw StateError('Pair this installation first.');
+      final ticketResponse = await http
+          .post(
+            Uri.parse('$tradingMemoryMarketDataBaseUrl/api/kite/login-ticket'),
+            headers: {
+              'X-Trading-Memory-Token': token,
+              'Accept': 'application/json',
+            },
+          )
+          .timeout(const Duration(seconds: 15));
       if (ticketResponse.statusCode < 200 || ticketResponse.statusCode >= 300) {
-        throw StateError('Could not prepare Zerodha login (HTTP ${ticketResponse.statusCode}).');
+        throw StateError(
+          'Could not prepare Zerodha login (HTTP ${ticketResponse.statusCode}).',
+        );
       }
       final decoded = jsonDecode(ticketResponse.body);
       final ticket = decoded is Map ? decoded['ticket']?.toString() : null;
-      if (ticket == null || ticket.isEmpty) throw StateError('The server did not issue a login ticket.');
-      final uri = Uri.parse('$tradingMemoryMarketDataBaseUrl/api/kite/login').replace(queryParameters: {'ticket': ticket});
+      if (ticket == null || ticket.isEmpty)
+        throw StateError('The server did not issue a login ticket.');
+      final uri = Uri.parse('$tradingMemoryMarketDataBaseUrl/api/kite/login')
+          .replace(queryParameters: {'ticket': ticket});
       final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
-      if (!opened) throw StateError('Could not open the hosted Zerodha login URL.');
+      if (!opened)
+        throw StateError('Could not open the hosted Zerodha login URL.');
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(error.toString().replaceFirst('Exception: ', ''))),
+          SnackBar(
+            content: Text(error.toString().replaceFirst('Exception: ', '')),
+          ),
         );
       }
     }
@@ -558,19 +618,33 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
         children: [
           Row(
             children: [
-              Icon(_connected ? Icons.check_circle : (_paired ? Icons.warning_amber : Icons.link_off),
-                  color: _connected ? Colors.green : Colors.orange),
+              Icon(
+                _connected
+                    ? Icons.check_circle
+                    : (_paired ? Icons.warning_amber : Icons.link_off),
+                color: _connected ? Colors.green : Colors.orange,
+              ),
               const SizedBox(width: 8),
-              Expanded(child: Text(_connected ? 'Zerodha connected' : (_paired ? 'App paired · Zerodha login needed' : 'Connect to hosted market data'),
-                  style: const TextStyle(fontWeight: FontWeight.w800))),
+              Expanded(
+                child: Text(
+                  _connected
+                      ? 'Zerodha connected'
+                      : (_paired
+                            ? 'App paired · Zerodha login needed'
+                            : 'Connect to hosted market data'),
+                  style: const TextStyle(fontWeight: FontWeight.w800),
+                ),
+              ),
               TextButton(onPressed: _initialize, child: const Text('Check')),
             ],
           ),
           const SizedBox(height: 6),
-          Text(_connected
-              ? 'Live NIFTY contracts and quotes are served by your hosted backend. Your trade journal remains on this device.'
-              : 'This app connects directly to your hosted HTTPS backend. Your Mac does not need to be running.',
-              style: const TextStyle(color: Colors.black54, height: 1.35)),
+          Text(
+            _connected
+                ? 'Live NIFTY contracts and quotes are served by your hosted backend. Your trade journal remains on this device.'
+                : 'This app connects directly to your hosted HTTPS backend. Your Mac does not need to be running.',
+            style: const TextStyle(color: Colors.black54, height: 1.35),
+          ),
           if (!_paired) ...[
             const SizedBox(height: 12),
             TextField(
@@ -585,24 +659,42 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
               ),
             ),
             const SizedBox(height: 8),
-            SizedBox(width: double.infinity, child: FilledButton.icon(
-              onPressed: _pairing ? null : _pairDevice,
-              icon: _pairing ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.phonelink_lock),
-              label: Text(_pairing ? 'Pairing…' : 'Pair this installation'),
-            )),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: _pairing ? null : _pairDevice,
+                icon: _pairing
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.phonelink_lock),
+                label: Text(_pairing ? 'Pairing…' : 'Pair this installation'),
+              ),
+            ),
             const SizedBox(height: 8),
             const SizedBox(height: 6),
-            SelectableText(tradingMemoryMarketDataBaseUrl, style: Theme.of(context).textTheme.bodySmall),
+            SelectableText(
+              tradingMemoryMarketDataBaseUrl,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
           ],
           if (_paired && !_connected) ...[
             const SizedBox(height: 12),
-            SizedBox(width: double.infinity, child: FilledButton.icon(
-              onPressed: _openZerodhaLogin,
-              icon: const Icon(Icons.open_in_browser),
-              label: const Text('Connect Zerodha on hosted server'),
-            )),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: _openZerodhaLogin,
+                icon: const Icon(Icons.open_in_browser),
+                label: const Text('Connect Zerodha on hosted server'),
+              ),
+            ),
             const SizedBox(height: 6),
-            const Text('After completing Zerodha login in the browser, return here and tap Check.', style: TextStyle(fontSize: 12, color: Colors.black54)),
+            const Text(
+              'After completing Zerodha login in the browser, return here and tap Check.',
+              style: TextStyle(fontSize: 12, color: Colors.black54),
+            ),
           ],
         ],
       ),
@@ -627,7 +719,9 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
                     child: Text(_dateKey(expiry)),
                   ),
               ],
-              onChanged: _loadingChain ? null : _changeExpiry,
+              onChanged: _loadingChain || widget.existingOnly
+                  ? null
+                  : _changeExpiry,
             ),
           ),
           const SizedBox(width: 10),
@@ -872,6 +966,7 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
                   strike,
                   type,
                   selected?.side == ExecutionSide.buy,
+                  disabled: widget.existingOnly,
                 ),
               ),
               const SizedBox(width: 3),
@@ -883,6 +978,7 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
                   strike,
                   type,
                   selected?.side == ExecutionSide.sell,
+                  disabled: widget.existingOnly,
                 ),
               ),
             ],
@@ -971,11 +1067,12 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
     Map<String, dynamic>? quote,
     int strike,
     OptionType type,
-    bool selected,
-  ) => SizedBox(
+    bool selected, {
+    bool disabled = false,
+  }) => SizedBox(
     height: 28,
     child: FilledButton(
-      onPressed: quote == null
+      onPressed: quote == null || disabled
           ? null
           : () => _selectContract(quote, strike, type, side),
       style: FilledButton.styleFrom(
@@ -1018,7 +1115,7 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
                     ),
                   ),
                 ),
-                if (_selectedLegs.isNotEmpty)
+                if (_selectedLegs.isNotEmpty && !widget.existingOnly)
                   TextButton.icon(
                     onPressed: () {
                       setState(() {
@@ -1074,12 +1171,13 @@ class _NiftyOptionChainPageState extends State<NiftyOptionChainPage> {
                 'Lot ${leg.lotSize}',
                 style: const TextStyle(fontSize: 11, color: Colors.black54),
               ),
-              IconButton(
-                visualDensity: VisualDensity.compact,
-                tooltip: 'Remove leg',
-                onPressed: () => _removeSelectedLeg(leg),
-                icon: const Icon(Icons.delete_outline),
-              ),
+              if (!widget.existingOnly)
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  tooltip: 'Remove leg',
+                  onPressed: () => _removeSelectedLeg(leg),
+                  icon: const Icon(Icons.delete_outline),
+                ),
             ],
           ),
           SegmentedButton<ExecutionSide>(

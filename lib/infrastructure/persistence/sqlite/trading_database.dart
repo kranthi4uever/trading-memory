@@ -1,7 +1,7 @@
 import 'package:sqflite/sqflite.dart';
 
 class TradingDatabase {
-  static const int schemaVersion = 10;
+  static const int schemaVersion = 11;
   static const String databaseName = 'trading_memory.db';
 
   final String? databasePath;
@@ -29,6 +29,7 @@ class TradingDatabase {
       // patch but missed the column due to an incomplete migration.
       onOpen: (db) async {
         await _ensureLifecycleAccountingSchema(db);
+        await _ensureEconomicSnapshotColumn(db, 'snapshot_charges');
         await _ensureAdjustmentDecisionColumns(db);
       },
     );
@@ -94,6 +95,9 @@ class TradingDatabase {
     }
     if (oldVersion < 10) {
       await _ensureAdjustmentDecisionColumns(db);
+    }
+    if (oldVersion < 11) {
+      await _ensureEconomicSnapshotColumn(db, 'snapshot_charges');
     }
     if (oldVersion >= 2 && oldVersion < 5) {
       await db.execute(
@@ -350,6 +354,7 @@ class TradingDatabase {
         cost REAL,
         gross_realized_pnl REAL,
         gross_unrealized_pnl REAL,
+        snapshot_charges REAL,
         actual_charges REAL,
         net_realized_pnl REAL,
         return_on_margin_percentage REAL,

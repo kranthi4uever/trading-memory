@@ -7,8 +7,14 @@ class EconomicSnapshot {
 
   /// Final-trade values. Null means not recorded/available, never zero by assumption.
   final double? grossRealizedPnl;
+
   /// Mark-to-market P&L on legs still open at this snapshot. Null means unavailable.
   final double? grossUnrealizedPnl;
+
+  /// Broker-confirmed charges incurred since the previous position snapshot.
+  final double? snapshotCharges;
+
+  /// Cumulative broker-confirmed charges for the trade up to this snapshot.
   final double? actualCharges;
   final double? netRealizedPnl;
   final double? returnOnMarginPercentage;
@@ -26,6 +32,7 @@ class EconomicSnapshot {
     required this.cost,
     this.grossRealizedPnl,
     this.grossUnrealizedPnl,
+    this.snapshotCharges,
     this.actualCharges,
     this.netRealizedPnl,
     this.returnOnMarginPercentage,

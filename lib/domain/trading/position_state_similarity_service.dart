@@ -61,6 +61,10 @@ class PositionStateSimilarityService {
             historical.position.legs.isEmpty) {
           continue;
         }
+        // Structure is a hard eligibility gate, not a weighted preference.
+        // A strangle must never be ranked against a vertical spread just
+        // because DTE, VIX, or spot happen to be similar.
+        if (!_sameStructuralFamily(current, historical)) continue;
         final factors = _factors(current, historical);
         var weighted = 0.0;
         var totalWeight = 0.0;
@@ -73,12 +77,14 @@ class PositionStateSimilarityService {
         if (totalWeight == 0) continue;
         final score = weighted / totalWeight;
         if (score >= minimumScore) {
-          matches.add(SimilarPositionMatch(
-            trade: trade,
-            state: historical,
-            score: score,
-            factors: factors,
-          ));
+          matches.add(
+            SimilarPositionMatch(
+              trade: trade,
+              state: historical,
+              score: score,
+              factors: factors,
+            ),
+          );
         }
       }
     }
@@ -91,6 +97,99 @@ class PositionStateSimilarityService {
     return List.unmodifiable(matches.take(limit));
   }
 
+  bool _sameStructuralFamily(PositionState a, PositionState b) {
+    final legsA = a.position.legs;
+    final legsB = b.position.legs;
+    if (legsA.length != legsB.length) return false;
+
+    // Require the exact option-type/direction composition. Quantities are
+    // intentionally normalized, but a missing/extra long or short leg is a
+    // different position structure and is not eligible for similarity.
+    String composition(PositionState state) {
+      final parts =
+          state.position.legs
+              .map((leg) => '${leg.contract.optionType.name}|${leg.side.name}')
+              .toList()
+            ..sort();
+      return parts.join(',');
+    }
+
+    if (composition(a) != composition(b)) return false;
+    return _structuralFamily(a) == _structuralFamily(b);
+  }
+
+  String _structuralFamily(PositionState state) {
+    final legs = state.position.legs;
+    if (legs.length == 2) {
+      final first = legs[0];
+      final second = legs[1];
+      final sameExpiry = first.contract.expiry == second.contract.expiry;
+      if (!sameExpiry) return 'calendar-or-diagonal';
+      if (first.contract.optionType != second.contract.optionType) {
+        final sameSide = first.side == second.side;
+        if (sameSide) {
+          return first.contract.strike == second.contract.strike
+              ? 'straddle'
+              : 'strangle';
+        }
+        return 'mixed-call-put-two-leg';
+      }
+      // A vertical is not a single family: bull and bear spreads have
+      // opposite buy/sell placement across the strikes. Compare the side at
+      // each strike rank so a bull call spread cannot match a bear call spread.
+      final ordered = [...legs]
+        ..sort((x, y) => x.contract.strike.compareTo(y.contract.strike));
+      final low = ordered.first;
+      final high = ordered.last;
+      return '${low.contract.optionType.name}:${low.side.name}:'
+          '${high.contract.optionType.name}:${high.side.name}';
+    }
+
+    if (legs.length == 4) {
+      final shortCalls = legs
+          .where(
+            (leg) =>
+                leg.contract.optionType.name.toLowerCase().contains('call') &&
+                leg.side.name.toLowerCase() == 'sell',
+          )
+          .toList();
+      final shortPuts = legs
+          .where(
+            (leg) =>
+                leg.contract.optionType.name.toLowerCase().contains('put') &&
+                leg.side.name.toLowerCase() == 'sell',
+          )
+          .toList();
+      final longCalls = legs
+          .where(
+            (leg) =>
+                leg.contract.optionType.name.toLowerCase().contains('call') &&
+                leg.side.name.toLowerCase() == 'buy',
+          )
+          .toList();
+      final longPuts = legs
+          .where(
+            (leg) =>
+                leg.contract.optionType.name.toLowerCase().contains('put') &&
+                leg.side.name.toLowerCase() == 'buy',
+          )
+          .toList();
+      if (shortCalls.length == 1 &&
+          shortPuts.length == 1 &&
+          longCalls.length == 1 &&
+          longPuts.length == 1) {
+        return shortCalls.single.contract.strike ==
+                shortPuts.single.contract.strike
+            ? 'iron-butterfly'
+            : 'iron-condor';
+      }
+    }
+
+    // For structures not covered by named templates, retain exact leg
+    // composition as the eligibility gate and compare geometry afterwards.
+    return 'custom-${legs.length}-legs';
+  }
+
   List<PositionSimilarityFactor> _factors(
     PositionState current,
     PositionState historical,
@@ -98,67 +197,82 @@ class PositionStateSimilarityService {
     final result = <PositionSimilarityFactor>[];
     final a = current.position;
     final b = historical.position;
-    result.add(PositionSimilarityFactor(
-      name: 'Leg structure',
-      weight: 35,
-      similarity: _legSimilarity(current, historical),
-      explanation: 'Compares option type, buy/sell direction and relative strike geometry; quantity is normalized.',
-    ));
-    result.add(PositionSimilarityFactor(
-      name: 'Strategy label',
-      weight: 5,
-      similarity: a.strategy == b.strategy ? 1 : 0.5,
-      explanation: a.strategy == b.strategy
-          ? 'Saved snapshot strategy labels match.'
-          : 'Strategy labels differ; actual legs are compared independently.',
-    ));
+    result.add(
+      PositionSimilarityFactor(
+        name: 'Leg structure',
+        weight: 35,
+        similarity: _legSimilarity(current, historical),
+        explanation: 'Compares option type, buy/sell direction and relative strike geometry; quantity is normalized.',
+      ),
+    );
+    result.add(
+      PositionSimilarityFactor(
+        name: 'Strategy label',
+        weight: 5,
+        similarity: a.strategy == b.strategy ? 1 : 0.5,
+        explanation: a.strategy == b.strategy
+            ? 'Saved snapshot strategy labels match.'
+            : 'Strategy labels differ; actual legs are compared independently.',
+      ),
+    );
 
     final currentDte = _dte(a.expiry.value, current.capturedAt);
     final historicalDte = _dte(b.expiry.value, historical.capturedAt);
-    result.add(PositionSimilarityFactor(
-      name: 'DTE',
-      weight: 15,
-      similarity: currentDte == null || historicalDte == null
-          ? null
-          : math.exp(-(currentDte - historicalDte).abs() / 14.0),
-      explanation: currentDte == null || historicalDte == null
-          ? 'DTE unavailable.'
-          : 'Current $currentDte days; historical $historicalDte days.',
-    ));
+    result.add(
+      PositionSimilarityFactor(
+        name: 'DTE',
+        weight: 15,
+        similarity: currentDte == null || historicalDte == null
+            ? null
+            : math.exp(-(currentDte - historicalDte).abs() / 14.0),
+        explanation: currentDte == null || historicalDte == null
+            ? 'DTE unavailable.'
+            : 'Current $currentDte days; historical $historicalDte days.',
+      ),
+    );
 
-    result.add(PositionSimilarityFactor(
-      name: 'Distance from spot',
-      weight: 15,
-      similarity: _spotGeometrySimilarity(current, historical),
-      explanation: 'Compares each leg strike relative to its snapshot spot, scaled by ATM straddle when available.',
-    ));
-    result.add(PositionSimilarityFactor(
-      name: 'Wing width',
-      weight: 10,
-      similarity: _relativeMetricSimilarity(
-        current.geometry.wingWidth,
-        historical.geometry.wingWidth,
+    result.add(
+      PositionSimilarityFactor(
+        name: 'Distance from spot',
+        weight: 15,
+        similarity: _spotGeometrySimilarity(current, historical),
+        explanation: 'Compares each leg strike relative to its snapshot spot, scaled by ATM straddle when available.',
       ),
-      explanation: 'Compares recorded wing widths proportionally.',
-    ));
-    result.add(PositionSimilarityFactor(
-      name: 'VIX',
-      weight: 10,
-      similarity: _relativeMetricSimilarity(
-        current.market.vix,
-        historical.market.vix,
+    );
+    result.add(
+      PositionSimilarityFactor(
+        name: 'Wing width',
+        weight: 10,
+        similarity: _relativeMetricSimilarity(
+          current.geometry.wingWidth,
+          historical.geometry.wingWidth,
+        ),
+        explanation: 'Compares recorded wing widths proportionally.',
       ),
-      explanation: 'Compares recorded VIX values; missing values are ignored.',
-    ));
-    result.add(PositionSimilarityFactor(
-      name: 'ATM straddle',
-      weight: 10,
-      similarity: _relativeMetricSimilarity(
-        current.market.atmStraddle,
-        historical.market.atmStraddle,
+    );
+    result.add(
+      PositionSimilarityFactor(
+        name: 'VIX',
+        weight: 10,
+        similarity: _relativeMetricSimilarity(
+          current.market.vix,
+          historical.market.vix,
+        ),
+        explanation:
+            'Compares recorded VIX values; missing values are ignored.',
       ),
-      explanation: 'Compares recorded ATM straddle values; missing values are ignored.',
-    ));
+    );
+    result.add(
+      PositionSimilarityFactor(
+        name: 'ATM straddle',
+        weight: 10,
+        similarity: _relativeMetricSimilarity(
+          current.market.atmStraddle,
+          historical.market.atmStraddle,
+        ),
+        explanation: 'Compares recorded ATM straddle values; missing values are ignored.',
+      ),
+    );
     return result;
   }
 
@@ -175,14 +289,18 @@ class PositionStateSimilarityService {
     if (left.length != right.length) return 0;
     final spotA = a.market.spot;
     final spotB = b.market.spot;
-    final scaleA = _positive(a.market.atmStraddle) ??
-        _positive(a.geometry.wingWidth) ?? 1.0;
-    final scaleB = _positive(b.market.atmStraddle) ??
-        _positive(b.geometry.wingWidth) ?? 1.0;
-    final descriptorsA = left.map((leg) => _descriptor(leg, spotA, scaleA)).toList()
-      ..sort();
-    final descriptorsB = right.map((leg) => _descriptor(leg, spotB, scaleB)).toList()
-      ..sort();
+    final scaleA =
+        _positive(a.market.atmStraddle) ??
+        _positive(a.geometry.wingWidth) ??
+        1.0;
+    final scaleB =
+        _positive(b.market.atmStraddle) ??
+        _positive(b.geometry.wingWidth) ??
+        1.0;
+    final descriptorsA =
+        left.map((leg) => _descriptor(leg, spotA, scaleA)).toList()..sort();
+    final descriptorsB =
+        right.map((leg) => _descriptor(leg, spotB, scaleB)).toList()..sort();
     var total = 0.0;
     for (var i = 0; i < descriptorsA.length; i++) {
       final aParts = descriptorsA[i].split('|');
@@ -211,10 +329,14 @@ class PositionStateSimilarityService {
       return null;
     }
     if (a.position.legs.length != b.position.legs.length) return 0;
-    final scaleA = _positive(a.market.atmStraddle) ??
-        _positive(a.geometry.wingWidth) ?? 1.0;
-    final scaleB = _positive(b.market.atmStraddle) ??
-        _positive(b.geometry.wingWidth) ?? 1.0;
+    final scaleA =
+        _positive(a.market.atmStraddle) ??
+        _positive(a.geometry.wingWidth) ??
+        1.0;
+    final scaleB =
+        _positive(b.market.atmStraddle) ??
+        _positive(b.geometry.wingWidth) ??
+        1.0;
     final remaining = [...b.position.legs];
     var total = 0.0;
     for (final legA in a.position.legs) {
@@ -225,7 +347,8 @@ class PositionStateSimilarityService {
       for (var i = 0; i < remaining.length; i++) {
         final legB = remaining[i];
         if (legA.contract.optionType != legB.contract.optionType ||
-            legA.side != legB.side) continue;
+            legA.side != legB.side)
+          continue;
         final normalizedB = (legB.contract.strike - spotB) / scaleB;
         final distance = (normalizedA - normalizedB).abs();
         if (distance < bestDistance) {
@@ -247,6 +370,5 @@ class PositionStateSimilarityService {
     return math.exp(-math.log(ratio));
   }
 
-  double? _positive(double? value) =>
-      value != null && value > 0 ? value : null;
+  double? _positive(double? value) => value != null && value > 0 ? value : null;
 }

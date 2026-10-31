@@ -990,6 +990,7 @@ class SqliteTradingRepository implements TradingRepository {
         grossRealizedPnl: (snapshot['gross_realized_pnl'] as num?)?.toDouble(),
         grossUnrealizedPnl: (snapshot['gross_unrealized_pnl'] as num?)
             ?.toDouble(),
+        snapshotCharges: (snapshot['snapshot_charges'] as num?)?.toDouble(),
         actualCharges: (snapshot['actual_charges'] as num?)?.toDouble(),
         netRealizedPnl: (snapshot['net_realized_pnl'] as num?)?.toDouble(),
         returnOnMarginPercentage:
@@ -1246,6 +1247,7 @@ class SqliteTradingRepository implements TradingRepository {
         'cost': state.economics.cost,
         'gross_realized_pnl': state.economics.grossRealizedPnl,
         'gross_unrealized_pnl': state.economics.grossUnrealizedPnl,
+        'snapshot_charges': state.economics.snapshotCharges,
         'actual_charges': state.economics.actualCharges,
         'net_realized_pnl': state.economics.netRealizedPnl,
         'return_on_margin_percentage': state.economics.returnOnMarginPercentage,

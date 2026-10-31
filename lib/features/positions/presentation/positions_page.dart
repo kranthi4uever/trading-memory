@@ -92,6 +92,24 @@ String _dateTimeLabel(DateTime value) {
   return '${_dateLabel(local)} ${local.hour.toString().padLeft(2, '0')}:${local.minute.toString().padLeft(2, '0')}:${local.second.toString().padLeft(2, '0')}';
 }
 
+/// True when an execution's contract appears in at least one saved position
+/// snapshot. This excludes orphaned option-chain draft selections from
+/// user-facing execution history and lifecycle calculations without deleting
+/// raw execution records. A legitimately exited leg remains represented by
+/// the earlier snapshot in which it was open.
+bool _hasSnapshotEvidenceForExecution(Trade trade, Execution execution) {
+  if (trade.positionStates.isEmpty) return true;
+  return trade.positionStates.any(
+    (state) => state.position.legs.any((leg) {
+      final contract = leg.contract;
+      return contract.underlying == execution.contract.underlying &&
+          contract.expiry == execution.contract.expiry &&
+          contract.strike == execution.contract.strike &&
+          contract.optionType == execution.contract.optionType;
+    }),
+  );
+}
+
 class PositionsPage extends StatelessWidget {
   const PositionsPage({
     super.key,
@@ -232,7 +250,7 @@ class PositionsPage extends StatelessWidget {
               Card(
                 margin: EdgeInsets.zero,
                 child: Padding(
-                  padding: const EdgeInsets.all(14),
+                  padding: const EdgeInsets.all(12),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -243,10 +261,10 @@ class PositionsPage extends StatelessWidget {
                           fontWeight: FontWeight.w800,
                         ),
                       ),
-                      const SizedBox(height: 10),
+                      const SizedBox(height: 8),
                       LayoutBuilder(
                         builder: (context, constraints) {
-                          const gap = 12.0;
+                          const gap = 8.0;
                           final actionWidth = (constraints.maxWidth - gap) / 2;
                           return Wrap(
                             spacing: gap,
@@ -257,13 +275,6 @@ class PositionsPage extends StatelessWidget {
                                 icon: Icons.add,
                                 label: 'Add legs',
                                 onPressed: () => _addLegs(context, latestState),
-                              ),
-                              _PositionActionButton(
-                                width: actionWidth,
-                                icon: Icons.edit_outlined,
-                                label: 'Edit legs',
-                                onPressed: () =>
-                                    _editLegs(context, latestState),
                               ),
                               _PositionActionButton(
                                 width: actionWidth,
@@ -279,23 +290,65 @@ class PositionsPage extends StatelessWidget {
                                 onPressed: () =>
                                     _holdPosition(context, latestState),
                               ),
+                              _PositionActionButton(
+                                width: actionWidth,
+                                icon: Icons.edit_outlined,
+                                label: 'Edit legs',
+                                onPressed: () => Navigator.of(context).push(
+                                  MaterialPageRoute<void>(
+                                    builder: (_) => Scaffold(
+                                      appBar: AppBar(
+                                        title: const Text('Edit legs'),
+                                      ),
+                                      body: SafeArea(
+                                        child: ListView(
+                                          padding: const EdgeInsets.all(16),
+                                          children: [
+                                            const Text(
+                                              'Correct the quantity or entry premium for existing legs.',
+                                            ),
+                                            const SizedBox(height: 12),
+                                            _InlinePositionLegEditor(
+                                              legs: latestState.position.legs,
+                                              onSave: (updatedLegs) async {
+                                                await _captureUpdatedState(
+                                                  context,
+                                                  latestState,
+                                                  updatedLegs,
+                                                  DecisionAction.adjust,
+                                                  'Corrected existing leg quantity and/or entry price.',
+                                                  recordDecision: false,
+                                                  refreshPageAfterSave: true,
+                                                );
+                                                if (context.mounted) {
+                                                  Navigator.of(context).pop();
+                                                }
+                                              },
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
                             ],
                           );
                         },
                       ),
-                      const SizedBox(height: 16),
+                      const SizedBox(height: 10),
                       SizedBox(
                         width: double.infinity,
-                        height: 54,
+                        height: 42,
                         child: FilledButton.icon(
                           style: FilledButton.styleFrom(
                             backgroundColor: const Color(0xFF176B87),
                             foregroundColor: Colors.white,
-                            minimumSize: const Size.fromHeight(54),
+                            minimumSize: const Size.fromHeight(42),
                             shape: const StadiumBorder(),
-                            padding: const EdgeInsets.symmetric(horizontal: 20),
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
                             textStyle: const TextStyle(
-                              fontSize: 16,
+                              fontSize: 14,
                               fontWeight: FontWeight.w600,
                             ),
                           ),
@@ -315,7 +368,10 @@ class PositionsPage extends StatelessWidget {
                               ),
                             ),
                           ),
-                          icon: const Icon(Icons.psychology_alt_outlined),
+                          icon: const Icon(
+                            Icons.psychology_alt_outlined,
+                            size: 18,
+                          ),
                           label: const Text('Open Adjustment Assistant'),
                         ),
                       ),
@@ -727,75 +783,6 @@ class PositionsPage extends StatelessWidget {
     }
   }
 
-  Future<void> _editLegs(BuildContext context, PositionState latest) async {
-    final repo = repository;
-    if (repo == null || latest.position.legs.isEmpty) return;
-    final legs = latest.position.legs;
-    final premiums = legs
-        .map(
-          (l) => TextEditingController(
-            text: l.entryPremium?.toStringAsFixed(2) ?? '',
-          ),
-        )
-        .toList();
-    try {
-      final save = await Navigator.of(context).push<bool>(
-        MaterialPageRoute(
-          builder: (_) => _EditLegsForm(legs: legs, premiums: premiums),
-        ),
-      );
-      if (save != true || !context.mounted) return;
-
-      final updatedLegs = <PositionLeg>[];
-      var changed = false;
-      for (var i = 0; i < legs.length; i++) {
-        final price = double.tryParse(premiums[i].text.trim());
-        if (price == null || !price.isFinite || price < 0) {
-          _message(
-            context,
-            'Enter a valid non-negative entry price for every leg.',
-            error: true,
-          );
-          return;
-        }
-        final old = legs[i];
-        if (price != old.entryPremium) changed = true;
-        updatedLegs.add(
-          PositionLeg(
-            contract: old.contract,
-            side: old.side,
-            quantity: old.quantity,
-            entryPremium: price,
-            marketPrice: old.marketPrice,
-          ),
-        );
-      }
-      if (!changed) {
-        _message(context, 'No price changes to save.');
-        return;
-      }
-
-      // Editing a recorded price corrects the position snapshot only. It is not
-      // a broker transaction, so do not fabricate closing/opening executions
-      // and do not record an ADJUST decision.
-      await _captureUpdatedState(
-        context,
-        latest,
-        updatedLegs,
-        DecisionAction.adjust,
-        'Corrected recorded entry price(s).',
-        recordDecision: false,
-      );
-    } catch (e) {
-      if (context.mounted)
-        _message(context, 'Could not edit leg prices: $e', error: true);
-    } finally {
-      for (final c in premiums) {
-        c.dispose();
-      }
-    }
-  }
-
   Future<void> _exitLegs(BuildContext context, PositionState latest) async {
     final repo = repository;
     if (repo == null || latest.position.legs.isEmpty) return;
@@ -1006,24 +993,38 @@ class PositionsPage extends StatelessWidget {
     String observation, {
     bool closeWhenEmpty = false,
     bool recordDecision = true,
+    bool skipMetricsForm = false,
+    bool refreshPageAfterSave = false,
   }) async {
     final repo = repository!;
-    // Review point-in-time metrics before committing a new position state.
-    // Blank fields stay unavailable; metrics from the prior state are never
-    // copied forward because they may no longer describe the changed position.
-    final metrics = await Navigator.of(context).push<_SnapshotMetricValues>(
-      MaterialPageRoute(
-        builder: (_) =>
-            _SnapshotMetricsForm(action: action, legCount: legs.length),
-      ),
-    );
-    if (metrics == null || !context.mounted) return;
 
-    // Capture market marks at the decision point, rather than reusing prices
-    // from the previous position state. Missing quotes stay unavailable.
+    // Fetch decision-time quotes before opening the metrics form. This gives
+    // the user fresh spot/VIX defaults while retaining the prior snapshot's
+    // known metrics as editable starting values.
     final captureMarket = await _refreshCaptureMarketData(legs);
     legs = captureMarket.legs;
     if (!context.mounted) return;
+
+    // Inline leg corrections remain inline. Other actions use the same
+    // prefilled review experience as initial entry; copied values are defaults
+    // only and can be edited before the new state is saved.
+    final metrics = skipMetricsForm
+        ? const _SnapshotMetricValues()
+        : await Navigator.of(context).push<_SnapshotMetricValues>(
+            MaterialPageRoute(
+              builder: (_) => _SnapshotMetricsForm(
+                action: action,
+                legCount: legs.length,
+                previous: previous,
+                liveSpot: captureMarket.spot,
+                liveVix: captureMarket.vix,
+              ),
+            ),
+          );
+    if (metrics == null || !context.mounted) return;
+
+    // Use the quotes fetched for this decision point. Missing values remain
+    // unavailable; they are never converted to zero.
     final capturedSpot = captureMarket.spot ?? metrics.spot;
     final capturedVix = captureMarket.vix ?? metrics.vix;
 
@@ -1044,14 +1045,25 @@ class PositionsPage extends StatelessWidget {
     // only the currently visible legs. Refresh from persistence because the
     // page's Trade object may predate executions just appended by this action.
     final latestTrade = await repo.getTrade(trade.id) ?? trade;
+    final evidencedExecutions = latestTrade.executions
+        .where(
+          (execution) =>
+              _hasSnapshotEvidenceForExecution(latestTrade, execution),
+        )
+        .toList(growable: false);
     final lifecycle = const TradeLifecycleAccounting().calculate(
-      executions: latestTrade.executions,
+      executions: evidencedExecutions,
       openLegs: legs,
     );
     // Actual charges are cumulative for the whole trade. Preserve a previously
     // recorded cumulative total when this snapshot leaves the field blank.
-    final cumulativeActualCharges =
-        metrics.actualCharges ?? previous.economics.actualCharges;
+    final currentSnapshotCharges = metrics.snapshotCharges;
+    final previousCumulativeCharges = previous.economics.actualCharges;
+    final cumulativeActualCharges = currentSnapshotCharges == null
+        ? previousCumulativeCharges
+        : previousCumulativeCharges == null
+        ? null
+        : previousCumulativeCharges + currentSnapshotCharges;
 
     // EDIT LEGS is a snapshot annotation, not a permanent position comment.
     // Remove a prior edit marker when creating any subsequent snapshot so a
@@ -1066,7 +1078,7 @@ class PositionsPage extends StatelessWidget {
               ? null
               : previousComments)
         : [
-            '[Snapshot action: EDIT LEGS — corrected recorded entry price(s)]',
+            '[Snapshot action: EDIT LEGS — corrected quantity and/or entry price(s)]',
             if (previousComments != null && previousComments.isNotEmpty)
               previousComments,
           ].join('\n');
@@ -1109,6 +1121,7 @@ class PositionsPage extends StatelessWidget {
           cost: metrics.cost,
           grossRealizedPnl: lifecycle.realizedGross,
           grossUnrealizedPnl: lifecycle.unrealizedGross,
+          snapshotCharges: currentSnapshotCharges,
           actualCharges: cumulativeActualCharges,
           netRealizedPnl: legs.isEmpty && cumulativeActualCharges != null
               ? lifecycle.realizedGross - cumulativeActualCharges!
@@ -1183,6 +1196,7 @@ class PositionsPage extends StatelessWidget {
           cost: metrics.cost,
           grossRealizedPnl: lifecycle.realizedGross,
           grossUnrealizedPnl: lifecycle.unrealizedGross,
+          snapshotCharges: currentSnapshotCharges,
           actualCharges: cumulativeActualCharges,
           netRealizedPnl: legs.isEmpty && cumulativeActualCharges != null
               ? lifecycle.realizedGross - cumulativeActualCharges!
@@ -1212,6 +1226,22 @@ class PositionsPage extends StatelessWidget {
       }
     }
     if (context.mounted) {
+      if (refreshPageAfterSave && !closeWhenEmpty) {
+        final refreshedTrade = await repo.getTrade(trade.id);
+        if (!context.mounted) return;
+        if (refreshedTrade != null) {
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute<void>(
+              builder: (_) => PositionsPage(
+                trade: refreshedTrade,
+                repository: repo,
+                similarMatches: similarMatches,
+              ),
+            ),
+          );
+          return;
+        }
+      }
       _message(
         context,
         closeWhenEmpty ? 'Position fully exited and closed.' : 'Position updated. The new snapshot records unavailable market metrics as unavailable rather than reusing stale values.',
@@ -1253,6 +1283,7 @@ class _SnapshotMetricValues {
     this.capitalDeployed,
     this.margin,
     this.cost,
+    this.snapshotCharges,
     this.actualCharges,
     this.maxProfit,
     this.maxLoss,
@@ -1274,14 +1305,29 @@ class _SnapshotMetricValues {
       capitalDeployed,
       margin,
       cost,
+      snapshotCharges,
       actualCharges;
   final double? maxProfit, maxLoss, delta, gamma, theta, vega, iv;
 }
 
+String _formatSnapshotMetric(double value) {
+  if (!value.isFinite) return '';
+  return value.toStringAsFixed(2).replaceFirst(RegExp(r'\.?0+$'), '');
+}
+
 class _SnapshotMetricsForm extends StatefulWidget {
-  const _SnapshotMetricsForm({required this.action, required this.legCount});
+  const _SnapshotMetricsForm({
+    required this.action,
+    required this.legCount,
+    required this.previous,
+    this.liveSpot,
+    this.liveVix,
+  });
   final DecisionAction action;
   final int legCount;
+  final PositionState previous;
+  final double? liveSpot;
+  final double? liveVix;
   @override
   State<_SnapshotMetricsForm> createState() => _SnapshotMetricsFormState();
 }
@@ -1303,7 +1349,8 @@ class _SnapshotMetricsFormState extends State<_SnapshotMetricsForm> {
     'capitalDeployed': 'Capital deployed',
     'margin': 'Margin',
     'cost': 'Other costs / estimates',
-    'actualCharges': 'Cumulative actual charges (broker-confirmed)',
+    'snapshotCharges': 'Charges for this snapshot (broker-confirmed)',
+    'actualCharges': 'Cumulative actual charges so far',
     'maxProfit': 'Maximum profit',
     'maxLoss': 'Maximum loss',
     'delta': 'Delta',
@@ -1316,10 +1363,41 @@ class _SnapshotMetricsFormState extends State<_SnapshotMetricsForm> {
   @override
   void initState() {
     super.initState();
+    final state = widget.previous;
+    final values = <String, double?>{
+      // Prefer fresh quote values for market-sensitive inputs.
+      'spot': widget.liveSpot ?? state.market.spot,
+      'vix': widget.liveVix ?? state.market.vix,
+      // These are editable carry-forward defaults, not assertions that they
+      // were recalculated for the changed position.
+      'atmStraddle': state.market.atmStraddle,
+      'lowerBreakeven': state.geometry.lowerBreakeven,
+      'upperBreakeven': state.geometry.upperBreakeven,
+      'wingWidth': state.geometry.wingWidth,
+      'distanceToLowerBreakeven': state.geometry.distanceToLowerBreakeven,
+      'distanceToUpperBreakeven': state.geometry.distanceToUpperBreakeven,
+      'profitRange': state.geometry.profitRange,
+      'pnlPercentage': state.economics.pnlPercentage,
+      'capitalDeployed': state.economics.capitalDeployed,
+      'margin': state.economics.margin,
+      'cost': state.economics.cost,
+      'snapshotCharges': null,
+      'actualCharges': state.economics.actualCharges,
+      'maxProfit': state.risk.maxProfit,
+      'maxLoss': state.risk.maxLoss,
+      'delta': state.risk.delta,
+      'gamma': state.risk.gamma,
+      'theta': state.risk.theta,
+      'vega': state.risk.vega,
+      'iv': state.risk.iv,
+    };
     for (final key in _labels.keys) {
-      // Do not prefill from the previous state: those values may be stale for
-      // this newly changed position. Leave unavailable metrics blank.
-      _fields[key] = TextEditingController();
+      final value = values[key];
+      _fields[key] = TextEditingController(
+        text: value != null && value.isFinite
+            ? _formatSnapshotMetric(value)
+            : '',
+      );
     }
   }
 
@@ -1328,6 +1406,26 @@ class _SnapshotMetricsFormState extends State<_SnapshotMetricsForm> {
     if (text.isEmpty) return null;
     final value = double.tryParse(text);
     return value != null && value.isFinite ? value : null;
+  }
+
+  void _updateCumulativeChargesPreview(String text) {
+    final current = double.tryParse(text.trim());
+    final previous = widget.previous.economics.actualCharges;
+    final cumulativeController = _fields['actualCharges']!;
+    if (text.trim().isEmpty || current == null || !current.isFinite) {
+      cumulativeController.text = previous == null
+          ? ''
+          : _formatSnapshotMetric(previous);
+      return;
+    }
+    if (previous == null) {
+      // Do not pretend the current increment is the trade's cumulative total
+      // when earlier charges are unavailable.
+      cumulativeController.text = '';
+      return;
+    }
+    final cumulative = previous + current;
+    cumulativeController.text = _formatSnapshotMetric(cumulative);
   }
 
   void _save() {
@@ -1368,6 +1466,7 @@ class _SnapshotMetricsFormState extends State<_SnapshotMetricsForm> {
         capitalDeployed: _value('capitalDeployed'),
         margin: _value('margin'),
         cost: _value('cost'),
+        snapshotCharges: _value('snapshotCharges'),
         actualCharges: _value('actualCharges'),
         maxProfit: _value('maxProfit'),
         maxLoss: _value('maxLoss'),
@@ -1407,6 +1506,10 @@ class _SnapshotMetricsFormState extends State<_SnapshotMetricsForm> {
                       width: width,
                       child: TextField(
                         controller: _fields[key],
+                        readOnly: key == 'actualCharges',
+                        onChanged: key == 'snapshotCharges'
+                            ? _updateCumulativeChargesPreview
+                            : null,
                         keyboardType: const TextInputType.numberWithOptions(
                           decimal: true,
                           signed: true,
@@ -1414,7 +1517,9 @@ class _SnapshotMetricsFormState extends State<_SnapshotMetricsForm> {
                         decoration: InputDecoration(
                           labelText: _labels[key],
                           helperText: key == 'actualCharges'
-                              ? 'Cumulative total; enter only broker-confirmed charges'
+                              ? 'Read-only cumulative total from saved snapshots'
+                              : key == 'snapshotCharges'
+                              ? 'Only charges confirmed for this snapshot/action; leave blank if unknown'
                               : 'Optional',
                           border: const OutlineInputBorder(),
                         ),
@@ -1463,7 +1568,7 @@ class _SnapshotMetricsFormState extends State<_SnapshotMetricsForm> {
           ),
           const SizedBox(height: 8),
           const Text(
-            'Review the metrics for this exact position state before saving. Enter values you know; leave anything unavailable blank. Metrics from an earlier snapshot are not copied forward.',
+            'Review the metrics for this position state before saving. Values from the prior snapshot are editable starting points; refresh or correct metrics that changed after adding or exiting legs. Leave anything unavailable blank.',
           ),
           if (widget.action == DecisionAction.hold) ...[
             const SizedBox(height: 12),
@@ -1785,6 +1890,15 @@ class _SimilarTradeCard extends StatelessWidget {
     final pnl = state.economics.pnl;
     final expiry = state.position.expiry.value;
     final percent = (match.score * 100).round();
+    // Use the same stable human-readable reference as the position timeline,
+    // so the user can locate this exact historical trade in the positions list.
+    final normalizedTradeId = trade.id.value
+        .replaceAll(RegExp(r'[^a-zA-Z0-9]'), '')
+        .toUpperCase();
+    final positionSuffix = normalizedTradeId.length <= 8
+        ? normalizedTradeId
+        : normalizedTradeId.substring(normalizedTradeId.length - 8);
+    final positionReference = 'Position #$positionSuffix';
     final topFactors = [...match.factors]
       ..sort((a, b) => (b.similarity ?? -1).compareTo(a.similarity ?? -1));
     return Card(
@@ -1796,7 +1910,7 @@ class _SimilarTradeCard extends StatelessWidget {
           style: const TextStyle(fontWeight: FontWeight.w700),
         ),
         subtitle: Text(
-          '$percent% contextual similarity · ${state.position.legs.length} legs · ${_dateLabel(state.capturedAt.toLocal())}',
+          '$positionReference · $percent% contextual similarity · ${state.position.legs.length} legs · ${_dateLabel(state.capturedAt.toLocal())}',
         ),
         trailing: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -1821,7 +1935,7 @@ class _SimilarTradeCard extends StatelessWidget {
           Align(
             alignment: Alignment.centerLeft,
             child: Text(
-              'Original trade: ${trade.strategy.name} · Closed ${trade.closedAt == null ? 'date unavailable' : _dateLabel(trade.closedAt!.toLocal())} · Expiry ${_dateLabel(expiry)}',
+              '$positionReference · Original trade: ${trade.strategy.name} · Closed ${trade.closedAt == null ? 'date unavailable' : _dateLabel(trade.closedAt!.toLocal())} · Expiry ${_dateLabel(expiry)}',
             ),
           ),
           const SizedBox(height: 6),
@@ -1863,14 +1977,304 @@ class _SimilarTradeCard extends StatelessWidget {
   }
 }
 
+class _InlinePositionLegEditor extends StatefulWidget {
+  const _InlinePositionLegEditor({required this.legs, required this.onSave});
+
+  final List<PositionLeg> legs;
+  final Future<void> Function(List<PositionLeg> legs) onSave;
+
+  @override
+  State<_InlinePositionLegEditor> createState() =>
+      _InlinePositionLegEditorState();
+}
+
+class _InlinePositionLegEditorState extends State<_InlinePositionLegEditor> {
+  static const int _niftyLotSize = 65;
+  bool _editing = false;
+  bool _expanded = false;
+  bool _saving = false;
+  late List<TextEditingController> _quantityControllers;
+  late List<TextEditingController> _premiumControllers;
+  late List<bool> _quantityInLots;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeControllers();
+  }
+
+  @override
+  void didUpdateWidget(covariant _InlinePositionLegEditor oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!_editing) _resetControllers();
+  }
+
+  void _initializeControllers() {
+    _quantityInLots = widget.legs
+        .map((leg) => leg.quantity % _niftyLotSize == 0)
+        .toList();
+    _quantityControllers = [
+      for (var i = 0; i < widget.legs.length; i++)
+        TextEditingController(
+          text: _quantityInLots[i]
+              ? '${widget.legs[i].quantity ~/ _niftyLotSize}'
+              : '${widget.legs[i].quantity}',
+        ),
+    ];
+    _premiumControllers = widget.legs
+        .map(
+          (leg) => TextEditingController(
+            text: leg.entryPremium?.toStringAsFixed(2) ?? '',
+          ),
+        )
+        .toList();
+  }
+
+  void _resetControllers() {
+    for (final controller in _quantityControllers) {
+      controller.dispose();
+    }
+    for (final controller in _premiumControllers) {
+      controller.dispose();
+    }
+    _initializeControllers();
+  }
+
+  @override
+  void dispose() {
+    for (final controller in _quantityControllers) {
+      controller.dispose();
+    }
+    for (final controller in _premiumControllers) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    final updated = <PositionLeg>[];
+    for (var i = 0; i < widget.legs.length; i++) {
+      final entered = int.tryParse(_quantityControllers[i].text.trim());
+      final quantity = entered == null
+          ? null
+          : (_quantityInLots[i] ? entered * _niftyLotSize : entered);
+      final premiumText = _premiumControllers[i].text.trim();
+      final premium = premiumText.isEmpty ? null : double.tryParse(premiumText);
+      if (quantity == null ||
+          quantity <= 0 ||
+          (_quantityInLots[i] && entered != null && entered <= 0) ||
+          (premiumText.isNotEmpty &&
+              (premium == null || !premium.isFinite || premium < 0))) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Enter a valid quantity and non-negative entry premium.',
+            ),
+          ),
+        );
+        return;
+      }
+      updated.add(
+        PositionLeg(
+          contract: widget.legs[i].contract,
+          side: widget.legs[i].side,
+          quantity: quantity,
+          entryPremium: premium,
+          marketPrice: widget.legs[i].marketPrice,
+        ),
+      );
+    }
+    setState(() => _saving = true);
+    try {
+      await widget.onSave(updated);
+      if (mounted)
+        setState(() {
+          _editing = false;
+          _expanded = false;
+          _saving = false;
+        });
+    } catch (_) {
+      if (mounted) setState(() => _saving = false);
+      rethrow;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'Position legs',
+                    style: TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                ),
+                FilledButton.icon(
+                  onPressed: widget.legs.isEmpty
+                      ? null
+                      : () => setState(() {
+                          if (_expanded) {
+                            _expanded = false;
+                            _editing = false;
+                            _resetControllers();
+                          } else {
+                            _expanded = true;
+                            _editing = true;
+                          }
+                        }),
+                  icon: Icon(
+                    _expanded ? Icons.expand_less : Icons.edit_outlined,
+                  ),
+                  label: Text(_expanded ? 'Hide legs' : 'Edit legs'),
+                ),
+              ],
+            ),
+            if (_expanded) ...[
+              for (var i = 0; i < widget.legs.length; i++) ...[
+                if (i > 0) const Divider(height: 16),
+                Text(
+                  '${widget.legs[i].side.name.toUpperCase()} ${widget.legs[i].contract.strike} ${widget.legs[i].contract.optionType == OptionType.call ? 'CE' : 'PE'}',
+                  style: const TextStyle(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 6),
+                if (!_editing)
+                  Text(
+                    'Qty ${widget.legs[i].quantity} · Entry ₹${widget.legs[i].entryPremium?.toStringAsFixed(2) ?? 'Unavailable'}',
+                  )
+                else ...[
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _quantityControllers[i],
+                          keyboardType: TextInputType.number,
+                          decoration: InputDecoration(
+                            labelText: _quantityInLots[i]
+                                ? 'Quantity (lots)'
+                                : 'Quantity (units)',
+                            helperText: _quantityInLots[i]
+                                ? '1 lot = $_niftyLotSize units'
+                                : 'Enter units',
+                            isDense: true,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      SegmentedButton<bool>(
+                        segments: const [
+                          ButtonSegment(value: true, label: Text('Lots')),
+                          ButtonSegment(value: false, label: Text('Units')),
+                        ],
+                        selected: {_quantityInLots[i]},
+                        onSelectionChanged: (value) {
+                          final toLots = value.first;
+                          final current = int.tryParse(
+                            _quantityControllers[i].text.trim(),
+                          );
+                          if (toLots &&
+                              current != null &&
+                              current % _niftyLotSize != 0) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text(
+                                  'Quantity must be divisible by 65 to display it in lots.',
+                                ),
+                              ),
+                            );
+                            return;
+                          }
+                          setState(() {
+                            if (current != null) {
+                              _quantityControllers[i].text = toLots
+                                  ? '${current ~/ _niftyLotSize}'
+                                  : '${current * _niftyLotSize}';
+                            }
+                            _quantityInLots[i] = toLots;
+                          });
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: _premiumControllers[i],
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
+                    decoration: const InputDecoration(
+                      labelText: 'Entry premium',
+                      prefixText: '₹',
+                      isDense: true,
+                    ),
+                  ),
+                ],
+              ],
+              if (_expanded && _editing) ...[
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: _saving
+                            ? null
+                            : () {
+                                setState(() {
+                                  _editing = false;
+                                  _resetControllers();
+                                });
+                              },
+                        child: const Text('Cancel'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: _saving ? null : _save,
+                        icon: _saving
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.save_outlined),
+                        label: const Text('Save changes'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _GroupedExecutions extends StatelessWidget {
   const _GroupedExecutions({required this.trade});
   final Trade trade;
   @override
   Widget build(BuildContext context) {
     final groups = <String, List<Execution>>{};
-    final sorted = [...trade.executions]
-      ..sort((a, b) => b.executedAt.compareTo(a.executedAt));
+    // Orphaned draft selections never represented by a saved position state
+    // are excluded from the displayed timeline. The raw ledger is retained.
+    final sorted =
+        trade.executions
+            .where(
+              (execution) => _hasSnapshotEvidenceForExecution(trade, execution),
+            )
+            .toList()
+          ..sort((a, b) => b.executedAt.compareTo(a.executedAt));
     for (final e in sorted) {
       final key =
           '${_dateLabel(e.executedAt.toLocal())}|${_dateLabel(e.contract.expiry.value)}';
@@ -2079,18 +2483,22 @@ class _InteractivePositionPayoff extends StatefulWidget {
 
 class _InteractivePositionPayoffState
     extends State<_InteractivePositionPayoff> {
+  // Keep presentation-only zoom when market refreshes recreate this widget.
+  static final Map<Object, double> _savedPayoffZoomByState = <Object, double>{};
+
   late double _spot;
   late double _vix;
   late double _dte;
   late double _initialSpot;
   late double _initialVix;
-  // Start at a tight, useful view; zooming out expands the spot range.
-  double _payoffZoom = 0.25;
+  // Start tight for a new position; restore the user's previous zoom if present.
+  late double _payoffZoom;
   late double _initialDte;
   late bool _spotWasCaptured;
   late bool _vixWasCaptured;
   Timer? _marketRefreshTimer;
   bool _scenarioMode = false;
+  bool _showPositionGreeks = false;
   bool _marketRefreshInProgress = false;
   double? _marketSpot;
   double? _marketVix;
@@ -2102,6 +2510,7 @@ class _InteractivePositionPayoffState
   void initState() {
     super.initState();
     final state = widget.state;
+    _payoffZoom = _savedPayoffZoomByState[state.id] ?? 0.25;
     final strikes = state.position.legs
         .map((l) => l.contract.strike.toDouble())
         .toList();
@@ -2397,6 +2806,69 @@ class _InteractivePositionPayoffState
       ? 'Unavailable'
       : '${value < 0 ? '−' : ''}₹${value.abs().toStringAsFixed(2)}';
 
+  /// Finds every expiry-payoff zero by solving the piecewise-linear payoff
+  /// between option strikes. This supports multi-leg positions with more than
+  /// two breakeven points; it does not assume lower/upper only.
+  List<double> _expiryBreakevens(List<PositionLeg> legs) {
+    if (legs.isEmpty || legs.any((leg) => _entryPremiumFor(leg) == null)) {
+      return const <double>[];
+    }
+    double pnlAt(double spot) {
+      var result = 0.0;
+      for (final leg in legs) {
+        final premium = _entryPremiumFor(leg)!;
+        final intrinsic = leg.contract.optionType == OptionType.call
+            ? math.max(0.0, spot - leg.contract.strike)
+            : math.max(0.0, leg.contract.strike - spot);
+        final sign = leg.side == PositionSide.buy ? 1.0 : -1.0;
+        result += sign * (intrinsic - premium) * leg.quantity;
+      }
+      return result;
+    }
+
+    final strikes =
+        legs.map((leg) => leg.contract.strike.toDouble()).toSet().toList()
+          ..sort();
+    if (strikes.isEmpty) return const <double>[];
+    final roots = <double>[];
+    const epsilon = 0.000001;
+    void addRoot(double root) {
+      if (!root.isFinite || root < 0) return;
+      if (!roots.any((existing) => (existing - root).abs() < 0.01)) {
+        roots.add(root);
+      }
+    }
+
+    final knots = <double>{0, ...strikes}.toList()..sort();
+    for (final knot in knots) {
+      if (pnlAt(knot).abs() < epsilon) addRoot(knot);
+    }
+    for (var i = 0; i < knots.length - 1; i++) {
+      final left = knots[i];
+      final right = knots[i + 1];
+      final leftPnl = pnlAt(left);
+      final rightPnl = pnlAt(right);
+      if (leftPnl * rightPnl < 0) {
+        addRoot(left + (right - left) * (-leftPnl) / (rightPnl - leftPnl));
+      }
+    }
+
+    // Above the highest strike, expiry payoff is linear. Extend that final
+    // segment analytically so a breakeven beyond the highest strike is found.
+    final lastStrike = strikes.last;
+    final step = math.max(1000.0, lastStrike * 0.25).toDouble();
+    final nextSpot = lastStrike + step;
+    final atLast = pnlAt(lastStrike);
+    final atNext = pnlAt(nextSpot);
+    final slope = (atNext - atLast) / step;
+    if (slope.abs() > epsilon) {
+      final root = lastStrike - atLast / slope;
+      if (root > lastStrike) addRoot(root);
+    }
+    roots.sort();
+    return roots;
+  }
+
   @override
   Widget build(BuildContext context) {
     final legs = widget.state.position.legs;
@@ -2532,34 +3004,152 @@ class _InteractivePositionPayoffState
     final expiryCurve = chartSpots
         .map((spot) => pnlAtSpot(spot, expiry: true))
         .toList();
+    final breakevens = missingEntry
+        ? const <double>[]
+        : _expiryBreakevens(legs);
+    final breakevenLabels = breakevens.map((price) {
+      final percent = _spot == 0 ? 0.0 : (price - _spot) / _spot * 100;
+      final sign = percent > 0 ? '+' : '';
+      return '${price.toStringAsFixed(0)}($sign${percent.toStringAsFixed(1)}%)';
+    }).toList();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text(
-          'Scenario payoff · based on this saved position state',
-          style: TextStyle(fontWeight: FontWeight.w700),
+        Text(
+          _marketFetchedAt == null
+              ? 'Last refreshed: waiting for market data'
+              : 'Last refreshed: ${_dateTimeLabel(_marketFetchedAt!)}',
+          style: const TextStyle(fontSize: 10, color: Colors.black54),
+        ),
+        const SizedBox(height: 2),
+        Row(
+          children: [
+            const Text(
+              'Zoom',
+              style: TextStyle(fontSize: 11, color: Colors.black54),
+            ),
+            const SizedBox(width: 4),
+            IconButton(
+              tooltip: 'Zoom in',
+              visualDensity: VisualDensity.compact,
+              constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+              padding: EdgeInsets.zero,
+              onPressed: _payoffZoom > 0.0625
+                  ? () => setState(() {
+                      _payoffZoom = (_payoffZoom * 0.75)
+                          .clamp(0.0625, 8.0)
+                          .toDouble();
+                      _savedPayoffZoomByState[widget.state.id] = _payoffZoom;
+                    })
+                  : null,
+              icon: const Icon(Icons.zoom_in, size: 20),
+            ),
+            IconButton(
+              tooltip: 'Zoom out',
+              visualDensity: VisualDensity.compact,
+              constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+              padding: EdgeInsets.zero,
+              onPressed: _payoffZoom < 8.0
+                  ? () => setState(() {
+                      _payoffZoom = (_payoffZoom / 0.75)
+                          .clamp(0.0625, 8.0)
+                          .toDouble();
+                      _savedPayoffZoomByState[widget.state.id] = _payoffZoom;
+                    })
+                  : null,
+              icon: const Icon(Icons.zoom_out, size: 20),
+            ),
+            TextButton(
+              style: TextButton.styleFrom(
+                visualDensity: VisualDensity.compact,
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+                minimumSize: Size.zero,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              onPressed: _payoffZoom == 0.25
+                  ? null
+                  : () => setState(() {
+                      _payoffZoom = 0.25;
+                      _savedPayoffZoomByState[widget.state.id] = _payoffZoom;
+                    }),
+              child: const Text('Reset zoom'),
+            ),
+          ],
+        ),
+        SizedBox(
+          height: 190,
+          width: double.infinity,
+          child: CustomPaint(
+            painter: _ScenarioPayoffPainter(
+              spots: chartSpots,
+              mtm: mtmCurve.map((v) => v ?? double.nan).toList(),
+              expiry: expiryCurve.map((v) => v ?? double.nan).toList(),
+              minSpot: minSpot,
+              maxSpot: maxSpot,
+              capturedSpot: _spot,
+              textColor: Theme.of(context).colorScheme.onSurface,
+            ),
+          ),
         ),
         const SizedBox(height: 5),
-        const Text(
-          'Market mode refreshes NIFTY spot, India VIX and available leg quotes every 15 seconds. Scenario MTM re-prices from the latest quote using Black–Scholes; unavailable quotes use a model estimate. Taxes, charges, dividends and volatility skew are excluded.',
-          style: TextStyle(fontSize: 12, color: Colors.black54, height: 1.35),
-        ),
-        if (!_spotWasCaptured || !_vixWasCaptured) ...[
-          const SizedBox(height: 6),
-          Text(
-            'Assumption: ${!_spotWasCaptured ? 'spot was not captured; slider starts at the average leg strike' : ''}${!_spotWasCaptured && !_vixWasCaptured ? '; ' : ''}${!_vixWasCaptured ? 'VIX was not captured; slider starts at a 15% IV proxy' : ''}.',
-            style: const TextStyle(fontSize: 12, color: Colors.deepOrange),
-          ),
-        ],
-        const SizedBox(height: 6),
         Text(
-          '${_scenarioMode ? 'Scenario mode' : 'Market-following mode'} · ${_marketFetchedAt == null ? (_marketStatus ?? 'Waiting for market data') : 'Snapshot ${_marketFetchedAt!.toLocal().toString().substring(0, 19)}'}${_marketStatus == null ? '' : ' · $_marketStatus'}',
-          style: TextStyle(
-            fontSize: 11,
-            color: _scenarioMode ? Colors.deepOrange : Colors.black54,
-          ),
+          'Breakeven (%)',
+          style: Theme.of(context).textTheme.labelMedium
+              ?.copyWith(fontWeight: FontWeight.w700),
         ),
-        const SizedBox(height: 14),
+        const SizedBox(height: 3),
+        if (missingEntry)
+          const Text(
+            'Unavailable — entry premium is missing for one or more legs.',
+            style: TextStyle(fontSize: 11, color: Colors.black54),
+          )
+        else if (breakevenLabels.isEmpty)
+          const Text(
+            'No breakeven points for this position.',
+            style: TextStyle(fontSize: 11, color: Colors.black54),
+          )
+        else
+          Wrap(
+            spacing: 6,
+            runSpacing: 5,
+            children: breakevenLabels
+                .map(
+                  (label) => Chip(
+                    label: Text(label, style: const TextStyle(fontSize: 11)),
+                    visualDensity: VisualDensity.compact,
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    padding: EdgeInsets.zero,
+                  ),
+                )
+                .toList(),
+          ),
+        const Wrap(
+          spacing: 12,
+          runSpacing: 2,
+          children: [
+            _CurveLegend(color: Color(0xFF176B87), label: 'MTM P&L'),
+            _CurveLegend(color: Color(0xFFE07A32), label: 'Expiry P&L'),
+          ],
+        ),
+        const SizedBox(height: 4),
+        Row(
+          children: [
+            Expanded(
+              child: _MetricChip(
+                label: 'MTM P&L',
+                value: missingEntry ? 'Unavailable' : _money(mtm),
+              ),
+            ),
+            const SizedBox(width: 6),
+            Expanded(
+              child: _MetricChip(
+                label: 'P&L at expiry',
+                value: missingEntry ? 'Unavailable' : _money(expiryPnl),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 5),
         _ScenarioSlider(
           label: 'Spot',
           value: _spot,
@@ -2576,7 +3166,6 @@ class _InteractivePositionPayoffState
         _ScenarioSlider(
           label: 'VIX / IV adjustment',
           value: _vix - (_marketVix ?? _initialVix),
-          // Volatility adjustment is relative to the latest market baseline.
           min: -math.min(
             (_marketVix ?? _initialVix) - 1.0,
             100.0 - (_marketVix ?? _initialVix),
@@ -2606,7 +3195,6 @@ class _InteractivePositionPayoffState
         ),
         _ScenarioSlider(
           label: 'DTE',
-          // Reverse the slider direction: full DTE on the left, expiry (0) on the right.
           value: (maxDte - _dte).clamp(0, maxDte).toDouble(),
           min: 0,
           max: maxDte,
@@ -2621,124 +3209,67 @@ class _InteractivePositionPayoffState
         Align(
           alignment: Alignment.centerRight,
           child: TextButton.icon(
+            style: TextButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
             onPressed: _resetAll,
-            icon: const Icon(Icons.restart_alt),
+            icon: const Icon(Icons.restart_alt, size: 18),
             label: const Text('Reset all scenarios'),
           ),
         ),
         const SizedBox(height: 4),
-        Row(
-          children: [
-            const Text(
-              'Zoom',
-              style: TextStyle(fontSize: 12, color: Colors.black54),
-            ),
-            const SizedBox(width: 8),
-            IconButton(
-              tooltip: 'Zoom in',
-              visualDensity: VisualDensity.compact,
-              onPressed: _payoffZoom > 0.0625
-                  ? () => setState(
-                      () => _payoffZoom = (_payoffZoom * 0.75)
-                          .clamp(0.0625, 8.0)
-                          .toDouble(),
-                    )
-                  : null,
-              icon: const Icon(Icons.zoom_in),
-            ),
-            IconButton(
-              tooltip: 'Zoom out',
-              visualDensity: VisualDensity.compact,
-              onPressed: _payoffZoom < 8.0
-                  ? () => setState(
-                      () => _payoffZoom = (_payoffZoom / 0.75)
-                          .clamp(0.0625, 8.0)
-                          .toDouble(),
-                    )
-                  : null,
-              icon: const Icon(Icons.zoom_out),
-            ),
-            TextButton(
-              onPressed: _payoffZoom == 0.25
-                  ? null
-                  : () => setState(() => _payoffZoom = 0.25),
-              child: const Text('Reset zoom'),
-            ),
-          ],
-        ),
-        SizedBox(
-          height: 220,
-          width: double.infinity,
-          child: CustomPaint(
-            painter: _ScenarioPayoffPainter(
-              spots: chartSpots,
-              mtm: mtmCurve.map((v) => v ?? double.nan).toList(),
-              expiry: expiryCurve.map((v) => v ?? double.nan).toList(),
-              minSpot: minSpot,
-              maxSpot: maxSpot,
-              // Mark the currently selected scenario spot, not the immutable
-              // historical capture spot, so the marker follows the slider.
-              capturedSpot: _spot,
-              textColor: Theme.of(context).colorScheme.onSurface,
-            ),
+        ExpansionTile(
+          tilePadding: EdgeInsets.zero,
+          childrenPadding: EdgeInsets.zero,
+          visualDensity: VisualDensity.compact,
+          initiallyExpanded: _showPositionGreeks,
+          onExpansionChanged: (expanded) =>
+              setState(() => _showPositionGreeks = expanded),
+          title: const Text(
+            'Position Greeks (modeled)',
+            style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
           ),
-        ),
-        const Wrap(
-          spacing: 14,
-          runSpacing: 6,
           children: [
-            _CurveLegend(color: Color(0xFF176B87), label: 'MTM P&L'),
-            _CurveLegend(color: Color(0xFFE07A32), label: 'Expiry P&L'),
-          ],
-        ),
-        const SizedBox(height: 10),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            _MetricChip(
-              label: 'MTM P&L at selected spot',
-              value: missingEntry ? 'Unavailable' : _money(mtm),
-            ),
-            _MetricChip(
-              label: 'Expiry P&L',
-              value: missingEntry ? 'Unavailable' : _money(expiryPnl),
-            ),
-          ],
-        ),
-        const SizedBox(height: 14),
-        const Text(
-          'Position Greeks (modeled)',
-          style: TextStyle(fontWeight: FontWeight.w700),
-        ),
-        const SizedBox(height: 8),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            _MetricChip(
-              label: 'Delta',
-              value: missingEntry ? 'Unavailable' : delta.toStringAsFixed(3),
-            ),
-            _MetricChip(
-              label: 'Gamma',
-              value: missingEntry ? 'Unavailable' : gamma.toStringAsFixed(5),
-            ),
-            _MetricChip(
-              label: 'Theta / day',
-              value: missingEntry ? 'Unavailable' : theta.toStringAsFixed(2),
-            ),
-            _MetricChip(
-              label: 'Vega / vol pt',
-              value: missingEntry ? 'Unavailable' : vega.toStringAsFixed(2),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                _MetricChip(
+                  label: 'Delta',
+                  value: missingEntry
+                      ? 'Unavailable'
+                      : delta.toStringAsFixed(3),
+                ),
+                _MetricChip(
+                  label: 'Gamma',
+                  value: missingEntry
+                      ? 'Unavailable'
+                      : gamma.toStringAsFixed(5),
+                ),
+                _MetricChip(
+                  label: 'Theta / day',
+                  value: missingEntry
+                      ? 'Unavailable'
+                      : theta.toStringAsFixed(2),
+                ),
+                _MetricChip(
+                  label: 'Vega / vol pt',
+                  value: missingEntry ? 'Unavailable' : vega.toStringAsFixed(2),
+                ),
+              ],
             ),
           ],
         ),
-        const SizedBox(height: 10),
         if (missingEntry)
-          const Text(
-            'Some saved legs do not match recorded executions, so MTM, expiry P&L and aggregate Greeks cannot be reconstructed reliably. Save entry premiums for each leg to enable these calculations.',
-            style: TextStyle(color: Colors.deepOrange, fontSize: 12),
+          const Padding(
+            padding: EdgeInsets.only(top: 4),
+            child: Text(
+              'Some saved legs do not match recorded executions, so MTM, expiry P&L and aggregate Greeks cannot be reconstructed reliably. Save entry premiums for each leg to enable these calculations.',
+              style: TextStyle(color: Colors.deepOrange, fontSize: 11),
+            ),
           ),
       ],
     );
@@ -2827,9 +3358,27 @@ class _ScenarioPayoffPainter extends CustomPainter {
         Offset(plot.left, zeroY),
         Offset(plot.right, zeroY),
         Paint()
-          ..color = textColor.withValues(alpha: .48)
-          ..strokeWidth = 1.1,
+          // Keep the zero-P&L reference subtle so it does not obscure curves.
+          ..color = textColor.withValues(alpha: .18)
+          ..strokeWidth = 0.7,
       );
+    }
+
+    // Draw the spot guide behind the payoff curves so it never masks them.
+    final guideSpot = capturedSpot;
+    if (guideSpot != null && guideSpot >= minSpot && guideSpot <= maxSpot) {
+      final spotX = xFor(guideSpot);
+      final marker = Paint()
+        ..color = const Color(0xFFB45309).withValues(alpha: .38)
+        ..strokeWidth = 0.8;
+      const dash = 4.0, gap = 3.5;
+      for (var y = plot.top; y < plot.bottom; y += dash + gap) {
+        canvas.drawLine(
+          Offset(spotX, y),
+          Offset(spotX, math.min(y + dash, plot.bottom)),
+          marker,
+        );
+      }
     }
 
     // Smooth interpolation between dense samples. The expiry payoff is still
@@ -2868,17 +3417,6 @@ class _ScenarioPayoffPainter extends CustomPainter {
     final spot = capturedSpot;
     if (spot != null && spot >= minSpot && spot <= maxSpot) {
       final spotX = xFor(spot);
-      final marker = Paint()
-        ..color = const Color(0xFFB45309).withValues(alpha: .9)
-        ..strokeWidth = 1.25;
-      const dash = 4.0, gap = 3.5;
-      for (var y = plot.top; y < plot.bottom; y += dash + gap) {
-        canvas.drawLine(
-          Offset(spotX, y),
-          Offset(spotX, math.min(y + dash, plot.bottom)),
-          marker,
-        );
-      }
       final label = spot.toStringAsFixed(0);
       tp.text = TextSpan(
         text: 'Spot $label',
@@ -2970,34 +3508,54 @@ class _ScenarioSlider extends StatelessWidget {
   final ValueChanged<double>? onChanged;
   final VoidCallback onReset;
   @override
-  Widget build(BuildContext context) => Column(
-    crossAxisAlignment: CrossAxisAlignment.start,
-    children: [
-      Row(
-        children: [
-          Expanded(
-            child: Text(
-              label,
-              style: const TextStyle(fontWeight: FontWeight.w600),
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(bottom: 2),
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                label,
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+            ),
+            Text(display, style: const TextStyle(fontWeight: FontWeight.w700)),
+            IconButton(
+              tooltip: 'Reset $label',
+              visualDensity: VisualDensity.compact,
+              constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+              padding: EdgeInsets.zero,
+              onPressed: onReset,
+              icon: const Icon(Icons.restart_alt, size: 18),
+            ),
+          ],
+        ),
+        SizedBox(
+          height: 26,
+          child: SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              trackHeight: 3,
+              overlayShape: SliderComponentShape.noOverlay,
+              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+              tickMarkShape: const RoundSliderTickMarkShape(
+                tickMarkRadius: 1.5,
+              ),
+            ),
+            child: Slider(
+              padding: EdgeInsets.zero,
+              value: value.clamp(min, max).toDouble(),
+              min: min,
+              max: max,
+              divisions: divisions,
+              onChanged: onChanged,
             ),
           ),
-          Text(display, style: const TextStyle(fontWeight: FontWeight.w700)),
-          IconButton(
-            tooltip: 'Reset $label',
-            visualDensity: VisualDensity.compact,
-            onPressed: onReset,
-            icon: const Icon(Icons.restart_alt, size: 18),
-          ),
-        ],
-      ),
-      Slider(
-        value: value.clamp(min, max).toDouble(),
-        min: min,
-        max: max,
-        divisions: divisions,
-        onChanged: onChanged,
-      ),
-    ],
+        ),
+      ],
+    ),
   );
 }
 
@@ -3006,7 +3564,7 @@ class _MetricChip extends StatelessWidget {
   final String label, value;
   @override
   Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
     decoration: BoxDecoration(
       color: Theme.of(context).colorScheme.surfaceContainerHighest,
       borderRadius: BorderRadius.circular(10),
@@ -3045,13 +3603,76 @@ class _StaticHistoricalPayoffState extends State<_StaticHistoricalPayoff> {
   Widget build(BuildContext context) {
     final trade = widget.trade;
     final state = widget.state;
-    if (state.position.legs.isEmpty ||
-        state.position.legs.any((leg) => leg.entryPremium == null)) {
-      return const Text(
-        'This historical snapshot predates per-leg price capture or has missing entry premiums. Its payoff cannot be reconstructed exactly, so no later execution price is substituted.',
+
+    // A final EXIT snapshot correctly has no open legs. For its payoff chart,
+    // show the most recent preceding snapshot that still had legs and saved
+    // entry premiums; keep the selected state's own P&L summary separate below.
+    final earlierOpenStates =
+        trade.positionStates
+            .where(
+              (candidate) =>
+                  candidate.capturedAt.isBefore(state.capturedAt) &&
+                  candidate.position.legs.isNotEmpty,
+            )
+            .toList()
+          ..sort((a, b) => b.capturedAt.compareTo(a.capturedAt));
+    final chartState = state.position.legs.isNotEmpty
+        ? state
+        : earlierOpenStates.isEmpty
+        ? null
+        : earlierOpenStates.first;
+
+    Widget pnlSummary() => Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Selected snapshot P&L · ${_dateTimeLabel(state.capturedAt)}',
+          style: const TextStyle(fontWeight: FontWeight.w700),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          'Realized gross P&L: ${state.economics.grossRealizedPnl == null ? 'Unavailable' : '₹${state.economics.grossRealizedPnl!.toStringAsFixed(2)}'}',
+        ),
+        Text(
+          'Unrealized gross P&L: ${state.economics.grossUnrealizedPnl == null ? 'Unavailable' : '₹${state.economics.grossUnrealizedPnl!.toStringAsFixed(2)}'}',
+        ),
+        Text(
+          'Total gross P&L: ${state.economics.pnl == null ? 'Unavailable' : '₹${state.economics.pnl!.toStringAsFixed(2)}'}',
+        ),
+        Text(
+          'Actual charges: ${state.economics.actualCharges == null ? 'Unavailable' : '₹${state.economics.actualCharges!.toStringAsFixed(2)}'}',
+        ),
+        Text(
+          'Net realized P&L: ${state.economics.netRealizedPnl == null ? 'Unavailable' : '₹${state.economics.netRealizedPnl!.toStringAsFixed(2)}'}',
+        ),
+      ],
+    );
+
+    if (chartState == null) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          pnlSummary(),
+          const SizedBox(height: 12),
+          const Text(
+            'No earlier snapshot with open legs is available, so an expiry payoff curve cannot be reconstructed. The saved P&L above is still shown.',
+          ),
+        ],
       );
     }
-    final strikes = state.position.legs
+    if (chartState.position.legs.any((leg) => leg.entryPremium == null)) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          pnlSummary(),
+          const SizedBox(height: 12),
+          const Text(
+            'The prior open snapshot is missing one or more entry premiums. Its expiry payoff cannot be reconstructed exactly; no later execution price is substituted.',
+          ),
+        ],
+      );
+    }
+    final strikes = chartState.position.legs
         .map((l) => l.contract.strike.toDouble())
         .toList();
     final minStrike = strikes.reduce((a, b) => a < b ? a : b);
@@ -3062,7 +3683,7 @@ class _StaticHistoricalPayoffState extends State<_StaticHistoricalPayoff> {
         .clamp(0.0, double.infinity)
         .toDouble();
     final baseHigh = maxStrike + padding;
-    final capturedSpot = state.market.spot;
+    final capturedSpot = chartState.market.spot;
     final baseLowWithSpot = capturedSpot == null
         ? baseLow
         : math.min(baseLow, math.max(0.0, capturedSpot * 0.98)).toDouble();
@@ -3079,7 +3700,7 @@ class _StaticHistoricalPayoffState extends State<_StaticHistoricalPayoff> {
     final high = chartCenter + halfRange;
     double payoff(double underlying) {
       var result = 0.0;
-      for (final leg in state.position.legs) {
+      for (final leg in chartState.position.legs) {
         final premium = leg.entryPremium!;
         final intrinsic = leg.contract.optionType == OptionType.call
             ? (underlying - leg.contract.strike)
@@ -3110,6 +3731,16 @@ class _StaticHistoricalPayoffState extends State<_StaticHistoricalPayoff> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        pnlSummary(),
+        const SizedBox(height: 10),
+        if (chartState.id != state.id)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Text(
+              'The selected snapshot has no open legs. The payoff curve below belongs to the preceding open snapshot captured ${_dateTimeLabel(chartState.capturedAt)}.',
+              style: const TextStyle(color: Colors.black54, fontSize: 12),
+            ),
+          ),
         const Text(
           'Historical expiry payoff · saved legs and entry premiums',
           style: TextStyle(color: Colors.black54, fontSize: 12),
@@ -3163,7 +3794,7 @@ class _StaticHistoricalPayoffState extends State<_StaticHistoricalPayoff> {
               maxX: high,
               minY: minY,
               maxY: maxY,
-              capturedSpot: state.market.spot,
+              capturedSpot: chartState.market.spot,
               textColor: Theme.of(context).colorScheme.onSurface,
               lineColor: _positionBrand,
             ),
@@ -3171,9 +3802,9 @@ class _StaticHistoricalPayoffState extends State<_StaticHistoricalPayoff> {
         ),
         const SizedBox(height: 6),
         Text(
-          state.market.spot == null
-              ? 'Spot was not captured for this historical state. No current spot is substituted, so the historical spot marker cannot be shown.'
-              : 'Spot at capture: ${state.market.spot!.toStringAsFixed(2)} · MTM P&L at capture: ${state.economics.pnl == null ? 'Unavailable' : '₹${state.economics.pnl!.toStringAsFixed(2)}'}',
+          chartState.market.spot == null
+              ? 'Spot was not captured for the payoff snapshot. No current spot is substituted, so the historical spot marker cannot be shown.'
+              : 'Spot at payoff snapshot: ${chartState.market.spot!.toStringAsFixed(2)}',
           style: const TextStyle(fontSize: 12, color: Colors.black54),
         ),
         const Text(
@@ -3246,8 +3877,9 @@ class _PayoffPainter extends CustomPainter {
         Offset(plot.left, zeroY),
         Offset(plot.right, zeroY),
         Paint()
-          ..color = textColor.withValues(alpha: .48)
-          ..strokeWidth = 1.1,
+          // Keep the zero-P&L reference subtle so it does not obscure curves.
+          ..color = textColor.withValues(alpha: .18)
+          ..strokeWidth = 0.7,
       );
     }
     final pts = <Offset>[];
@@ -3279,12 +3911,10 @@ class _PayoffPainter extends CustomPainter {
     final spot = capturedSpot;
     if (spot != null && spot >= minX && spot <= maxX) {
       final spotX = xFor(spot);
-      // A solid, high-contrast line makes the exact historical capture spot
-      // obvious even when the payoff curve crosses it. This value comes only
-      // from this saved PositionState; no current/live spot is substituted.
+      // Keep the historical spot guide subtle; payoff curves remain primary.
       final marker = Paint()
-        ..color = const Color(0xFFB45309)
-        ..strokeWidth = 2.2;
+        ..color = const Color(0xFFB45309).withValues(alpha: .28)
+        ..strokeWidth = 0.8;
       canvas.drawLine(
         Offset(spotX, plot.top),
         Offset(spotX, plot.bottom),
@@ -3362,18 +3992,18 @@ class _PositionActionButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) => SizedBox(
     width: width,
-    height: 52,
+    height: 40,
     child: OutlinedButton.icon(
       onPressed: onPressed,
-      icon: Icon(icon, size: 21),
+      icon: Icon(icon, size: 17),
       label: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis),
       style: OutlinedButton.styleFrom(
         foregroundColor: const Color(0xFF176B87),
         side: const BorderSide(color: Color(0xFF176B87), width: 1.3),
-        minimumSize: Size(width, 52),
-        padding: const EdgeInsets.symmetric(horizontal: 10),
+        minimumSize: Size(width, 40),
+        padding: const EdgeInsets.symmetric(horizontal: 8),
         shape: const StadiumBorder(),
-        textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+        textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
       ),
     ),
   );

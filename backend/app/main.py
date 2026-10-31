@@ -572,9 +572,16 @@ async def nifty_position_estimate(request: Request) -> dict[str, Any]:
     if charge_orders:
         try:
             charge_data = client.get_virtual_contract_note(charge_orders)
-            rows = charge_data if isinstance(charge_data, list) else []
-            total = sum(float((row.get("charges") or {}).get("total") or 0) for row in rows if isinstance(row, dict))
-            response["charges"] = {"total": total, "orders": rows}
+            if not isinstance(charge_data, list) or not charge_data:
+                response["charges_error"] = "Kite returned an unexpected or empty virtual contract-note response"
+            elif any(not isinstance(row, dict) or not isinstance(row.get("charges"), dict) or row["charges"].get("total") is None for row in charge_data):
+                response["charges_error"] = "Kite virtual contract-note response did not contain total charges for every order"
+            else:
+                total = sum(float(row["charges"]["total"]) for row in charge_data)
+                if not math.isfinite(total) or total < 0:
+                    response["charges_error"] = "Kite returned an invalid total for virtual contract-note charges"
+                else:
+                    response["charges"] = {"total": total, "orders": charge_data}
         except Exception as exc:
             response["charges_error"] = f"Kite charge calculation failed: {exc}"
     else:
