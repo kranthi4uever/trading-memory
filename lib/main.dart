@@ -611,7 +611,7 @@ class _PositionsHomeState extends State<PositionsHome> {
                     itemCount: trades.length,
                     separatorBuilder: (_, __) => const SizedBox(height: 8),
                     itemBuilder: (context, index) =>
-                        _positionBanner(trades[index]),
+                        _positionBanner(trades[index], index + 1),
                   ),
           ),
         ],
@@ -619,7 +619,19 @@ class _PositionsHomeState extends State<PositionsHome> {
     },
   );
 
-  Widget _positionBanner(Trade trade) {
+  String _positionReference(Trade trade) {
+    // Use the persisted trade ID, never the visible list index: sorting or
+    // filtering must not change a position's reference.
+    final normalized = trade.id.value
+        .replaceAll(RegExp(r'[^a-zA-Z0-9]'), '')
+        .toUpperCase();
+    final suffix = normalized.length <= 8
+        ? normalized
+        : normalized.substring(normalized.length - 8);
+    return 'Position #$suffix';
+  }
+
+  Widget _positionBanner(Trade trade, int positionNumber) {
     final pnl = _pnlOf(trade);
     final isLoss = pnl != null && pnl < 0;
     final pnlKnown = pnl != null;
@@ -653,6 +665,26 @@ class _PositionsHomeState extends State<PositionsHome> {
             ),
             title: Row(
               children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 5,
+                  ),
+                  margin: const EdgeInsets.only(right: 9),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFE8EDF8),
+                    borderRadius: BorderRadius.circular(7),
+                  ),
+                  child: Text(
+                    'POS ${positionNumber.toString().padLeft(2, '0')}',
+                    style: const TextStyle(
+                      color: Color(0xFF294A86),
+                      fontSize: 10,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 0.3,
+                    ),
+                  ),
+                ),
                 Expanded(
                   child: Text(
                     underlying,
@@ -687,7 +719,7 @@ class _PositionsHomeState extends State<PositionsHome> {
             subtitle: Padding(
               padding: const EdgeInsets.only(top: 6),
               child: Text(
-                'Expiry ${_dateLabel(_expiryOf(trade))} · ${trade.strategy.name}'
+                '${_positionReference(trade)} · Expiry ${_dateLabel(_expiryOf(trade))} · ${trade.strategy.name}'
                 '${pnl != null && trade.status == TradeStatus.confirmed && _livePnlAtByTrade[trade.id.value] != null ? ' · Last market quote ${_livePnlAtByTrade[trade.id.value]!.toLocal().toString().substring(0, 16)}' : ''}'
                 '${pnl != null && trade.status == TradeStatus.confirmed && _livePnlAtByTrade[trade.id.value] == null && (trade.positionStates.isEmpty || trade.positionStates.last.economics.pnl == null) ? ' · Saved marks (market quote unavailable)' : ''}'
                 '${pnl != null && trade.status == TradeStatus.closed && (trade.positionStates.isEmpty || trade.positionStates.last.economics.pnl == null) ? ' · Gross realized estimate' : ''}',

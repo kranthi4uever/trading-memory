@@ -1738,6 +1738,9 @@ class SqliteTradingRepository implements TradingRepository {
       'confirmed_at': episode.confirmedAt?.toIso8601String(),
       'status': episode.status.name,
       'failure_message': episode.failureMessage,
+      'decision_action': episode.decision?.action.name,
+      'decision_recorded_at': episode.decision?.recordedAt.toIso8601String(),
+      'decision_observation': episode.decision?.observation,
     };
     await db.insert(
       'adjustment_episodes',
@@ -1799,6 +1802,22 @@ class SqliteTradingRepository implements TradingRepository {
             reason: AdjustmentReason.values.byName(reasonName),
             reasonNote: row['reason_note'] as String?,
             selectedProposalId: row['selected_proposal_id'] as String?,
+            decision:
+                row['decision_action'] == null ||
+                    row['decision_recorded_at'] == null
+                ? null
+                : DecisionRecord(
+                    recordedAt: DateTime.parse(
+                      row['decision_recorded_at'] as String,
+                    ),
+                    positionStateId: PositionStateId(
+                      row['before_position_state_id'] as String,
+                    ),
+                    action: DecisionAction.values.byName(
+                      row['decision_action'] as String,
+                    ),
+                    observation: row['decision_observation'] as String?,
+                  ),
             executionIds: executionIds,
             createdAt: DateTime.parse(row['created_at'] as String),
             confirmedAt: row['confirmed_at'] == null

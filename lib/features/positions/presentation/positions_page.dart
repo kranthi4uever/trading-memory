@@ -59,6 +59,31 @@ class PositionInteractivePayoffPanel extends StatelessWidget {
   }
 }
 
+/// Reusable interactive payoff for an explicitly supplied position state.
+/// Used by Adjustment Assistant for both the current and simulated adjusted
+/// positions, sharing the same live/scenario controls as Position snapshots.
+class PositionStateInteractivePayoffPanel extends StatelessWidget {
+  const PositionStateInteractivePayoffPanel({
+    super.key,
+    required this.trade,
+    required this.state,
+  });
+
+  final Trade trade;
+  final PositionState state;
+
+  @override
+  Widget build(BuildContext context) {
+    if (state.position.legs.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.all(12),
+        child: Text('Payoff is unavailable because no open legs remain.'),
+      );
+    }
+    return _InteractivePositionPayoff(trade: trade, state: state);
+  }
+}
+
 String _dateLabel(DateTime value) =>
     '${value.year.toString().padLeft(4, '0')}-${value.month.toString().padLeft(2, '0')}-${value.day.toString().padLeft(2, '0')}';
 
@@ -121,6 +146,18 @@ class PositionsPage extends StatelessWidget {
     }
   }
 
+  String _positionReference() {
+    // Stable human-readable reference derived from the persisted trade ID.
+    // It does not depend on list order, strategy name, expiry, or date.
+    final normalized = trade.id.value
+        .replaceAll(RegExp(r'[^a-zA-Z0-9]'), '')
+        .toUpperCase();
+    final suffix = normalized.length <= 8
+        ? normalized
+        : normalized.substring(normalized.length - 8);
+    return 'Position #$suffix';
+  }
+
   String _money(double? value) =>
       value == null ? 'Unavailable' : '₹${value.toStringAsFixed(2)}';
   String _number(double? value, {String suffix = ''}) =>
@@ -165,7 +202,7 @@ class PositionsPage extends StatelessWidget {
     if (selectedState == null) {
       return Scaffold(
         appBar: AppBar(
-          title: const Text('Position timeline'),
+          title: Text('Position timeline · ${_positionReference()}'),
           backgroundColor: _positionPageBackground,
           actions: [
             if (repository != null)
@@ -180,7 +217,7 @@ class PositionsPage extends StatelessWidget {
           padding: const EdgeInsets.all(16),
           children: [
             Text(
-              '${trade.executions.first.contract.underlying} · ${trade.mode.name.toUpperCase()}',
+              '${trade.executions.first.contract.underlying} · ${trade.mode.name.toUpperCase()} · ${_positionReference()}',
               style: Theme.of(context).textTheme.headlineSmall,
             ),
             const SizedBox(height: 6),
@@ -289,8 +326,7 @@ class PositionsPage extends StatelessWidget {
               const SizedBox(height: 12),
             ],
             _SnapshotExpansion(
-              title:
-                  'Timeline:\n${history.length} ${history.length == 1 ? 'Snapshot' : 'Snapshots'}  ·  ${trade.decisionRecords.length} ${trade.decisionRecords.length == 1 ? 'Decision' : 'Decisions'}',
+              title: 'Timeline · ${history.length}',
               initiallyExpanded: true,
               child: _PositionTimeline(
                 trade: trade,
@@ -1880,96 +1916,55 @@ class _PositionTimeline extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final entries = <_TimelineEntry>[];
-    final representedStateIds = <PositionStateId>{};
-
-    // Present a decision and its linked immutable snapshot as one timeline
-    // event. The decision and snapshot remain separate persisted records.
-    for (final decision in trade.decisionRecords) {
-      PositionState? linkedState;
-      final stateId = decision.positionStateId;
-      if (stateId != null) {
-        for (final state in trade.positionStates) {
-          if (state.id == stateId) {
-            linkedState = state;
-            representedStateIds.add(state.id);
-            break;
-          }
-        }
-      }
-      entries.add(
-        _TimelineEntry(
-          time: decision.recordedAt,
-          state: linkedState,
-          decision: decision,
-        ),
-      );
-    }
-
-    // Keep snapshots that have no linked decision as their own timeline event.
-    for (final state in trade.positionStates) {
-      if (representedStateIds.contains(state.id)) continue;
-      entries.add(_TimelineEntry(time: state.capturedAt, state: state));
-    }
-
-    entries.sort((a, b) => b.time.compareTo(a.time));
-    final newestFirst = entries;
+    // The timeline is the position-state history. Decisions are not duplicated
+    // as separate timeline rows; the snapshots already show the resulting states.
+    final snapshots = [...trade.positionStates]
+      ..sort((a, b) => b.capturedAt.compareTo(a.capturedAt));
     return Column(
       children: [
-        for (var i = 0; i < newestFirst.length; i++) ...[
+        for (var i = 0; i < snapshots.length; i++) ...[
           if (i > 0) const Divider(height: 1),
-          _timelineTile(context, newestFirst[i]),
+          _snapshotTile(context, snapshots[i]),
         ],
       ],
     );
   }
 
-  Widget _timelineTile(BuildContext context, _TimelineEntry entry) {
-    final hasDecision = entry.decision != null;
-    final isLatest = entry.state?.id == latestState?.id;
-    final rawAction = entry.decision?.action;
-    final action = rawAction == DecisionAction.partialExit
-        ? 'PARTIAL_EXIT'
-        : rawAction?.name.toUpperCase();
-    final snapshotComment = entry.state?.position.comments?.trim();
+  Widget _snapshotTile(BuildContext context, PositionState state) {
+    final isLatest = state.id == latestState?.id;
+    final snapshotComment = state.position.comments?.trim();
     final isLegPriceEdit =
         snapshotComment?.contains('[Snapshot action: EDIT LEGS') == true;
-    final title = hasDecision
-        ? 'Decision · $action${entry.state == null ? '' : ' + position snapshot'}'
-        : '${isLegPriceEdit ? 'Edit legs snapshot' : (isLatest ? 'Latest position snapshot' : 'Position snapshot')} · ${entry.state!.position.strategy.name}';
-    final note = entry.decision?.observation?.trim();
-    final pnl = entry.state?.economics.pnl;
+    final pnl = state.economics.pnl;
     final details = <String>[
-      if (entry.state != null)
-        'Snapshot · Spot ${entry.state!.market.spot == null ? 'Unavailable' : entry.state!.market.spot!.toStringAsFixed(2)} · Total gross P&L ${pnl == null ? 'Unavailable' : '₹${pnl.toStringAsFixed(2)}'}',
-      if (entry.state?.economics.grossRealizedPnl != null)
-        'Realized gross P&L · ₹${entry.state!.economics.grossRealizedPnl!.toStringAsFixed(2)}',
-      if (entry.state?.economics.grossUnrealizedPnl != null)
-        'Unrealized gross P&L · ₹${entry.state!.economics.grossUnrealizedPnl!.toStringAsFixed(2)}',
-      if (entry.state?.economics.actualCharges != null)
-        'Actual charges to date · ₹${entry.state!.economics.actualCharges!.toStringAsFixed(2)}',
-      if (entry.state?.economics.grossRealizedPnl != null &&
-          entry.state?.economics.actualCharges != null)
-        'Realized net P&L to date · ₹${(entry.state!.economics.grossRealizedPnl! - entry.state!.economics.actualCharges!).toStringAsFixed(2)}',
-      if (isLegPriceEdit)
-        'Action · EDIT LEGS — corrected recorded entry price(s)',
-      if (hasDecision)
-        note?.isNotEmpty == true ? note! : 'No decision note recorded',
-      if (hasDecision && entry.state == null) 'Linked snapshot unavailable',
+      'Spot ${state.market.spot == null ? 'Unavailable' : state.market.spot!.toStringAsFixed(2)}',
+      'Total gross P&L ${pnl == null ? 'Unavailable' : '₹${pnl.toStringAsFixed(2)}'}',
+      if (state.economics.grossRealizedPnl != null)
+        'Realized gross P&L · ₹${state.economics.grossRealizedPnl!.toStringAsFixed(2)}',
+      if (state.economics.grossUnrealizedPnl != null)
+        'Unrealized gross P&L · ₹${state.economics.grossUnrealizedPnl!.toStringAsFixed(2)}',
+      if (state.economics.actualCharges != null)
+        'Actual charges to date · ₹${state.economics.actualCharges!.toStringAsFixed(2)}',
+      if (isLegPriceEdit) 'Snapshot note · corrected recorded leg price(s)',
     ];
     return ListTile(
       contentPadding: EdgeInsets.zero,
       leading: Icon(
-        hasDecision
-            ? Icons.psychology_alt_outlined
-            : (isLatest ? Icons.radio_button_checked : Icons.history),
+        isLatest ? Icons.radio_button_checked : Icons.history,
         color: isLatest ? _positionBrand : Colors.grey,
       ),
-      title: Text(title),
-      subtitle: Text('${_dateTimeLabel(entry.time)}\n${details.join('\n')}'),
+      title: Text(
+        '${isLegPriceEdit ? 'Leg-price correction' : (isLatest ? 'Latest position snapshot' : 'Position snapshot')} · ${state.position.strategy.name}',
+      ),
+      subtitle: Text(
+        '${_dateTimeLabel(state.capturedAt)}\n${details.join('\n')}',
+      ),
       isThreeLine: true,
-      trailing: entry.state != null ? const Icon(Icons.chevron_right) : null,
-      onTap: entry.state == null ? null : () => _openEntry(context, entry),
+      trailing: const Icon(Icons.chevron_right),
+      onTap: () => _openEntry(
+        context,
+        _TimelineEntry(time: state.capturedAt, state: state),
+      ),
     );
   }
 

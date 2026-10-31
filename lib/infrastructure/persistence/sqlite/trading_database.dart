@@ -1,7 +1,7 @@
 import 'package:sqflite/sqflite.dart';
 
 class TradingDatabase {
-  static const int schemaVersion = 9;
+  static const int schemaVersion = 10;
   static const String databaseName = 'trading_memory.db';
 
   final String? databasePath;
@@ -27,7 +27,10 @@ class TradingDatabase {
       onUpgrade: _upgradeSchema,
       // Repair databases that were already marked version 7 by an earlier
       // patch but missed the column due to an incomplete migration.
-      onOpen: _ensureLifecycleAccountingSchema,
+      onOpen: (db) async {
+        await _ensureLifecycleAccountingSchema(db);
+        await _ensureAdjustmentDecisionColumns(db);
+      },
     );
 
     return _database!;
@@ -89,6 +92,9 @@ class TradingDatabase {
     if (oldVersion < 9) {
       await _createAdjustmentTables(db);
     }
+    if (oldVersion < 10) {
+      await _ensureAdjustmentDecisionColumns(db);
+    }
     if (oldVersion >= 2 && oldVersion < 5) {
       await db.execute(
         'ALTER TABLE position_legs ADD COLUMN entry_premium REAL',
@@ -106,6 +112,26 @@ class TradingDatabase {
   /// advanced user_version without completing the schema change.
   Future<void> _ensureLifecycleAccountingSchema(DatabaseExecutor db) async {
     await _ensureEconomicSnapshotColumn(db, 'gross_unrealized_pnl');
+  }
+
+  Future<void> _ensureAdjustmentDecisionColumns(DatabaseExecutor db) async {
+    final columns = await db.rawQuery('PRAGMA table_info(adjustment_episodes)');
+    final names = columns.map((column) => column['name']).toSet();
+    if (!names.contains('decision_action')) {
+      await db.execute(
+        'ALTER TABLE adjustment_episodes ADD COLUMN decision_action TEXT',
+      );
+    }
+    if (!names.contains('decision_recorded_at')) {
+      await db.execute(
+        'ALTER TABLE adjustment_episodes ADD COLUMN decision_recorded_at TEXT',
+      );
+    }
+    if (!names.contains('decision_observation')) {
+      await db.execute(
+        'ALTER TABLE adjustment_episodes ADD COLUMN decision_observation TEXT',
+      );
+    }
   }
 
   Future<void> _ensureEconomicSnapshotColumn(
@@ -397,6 +423,9 @@ class TradingDatabase {
         confirmed_at TEXT,
         status TEXT NOT NULL CHECK (status IN ('proposed','pendingConfirmation','pendingExecution','applied','partiallyApplied','failed','cancelled')),
         failure_message TEXT,
+        decision_action TEXT,
+        decision_recorded_at TEXT,
+        decision_observation TEXT,
         FOREIGN KEY (before_position_state_id, trade_id)
           REFERENCES position_states(id, trade_id) ON DELETE RESTRICT,
         FOREIGN KEY (after_position_state_id, trade_id)
